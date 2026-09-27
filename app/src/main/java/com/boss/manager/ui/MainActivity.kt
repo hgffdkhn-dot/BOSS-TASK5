@@ -6,6 +6,16 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
+/* ⚠️ Icons 不在 material3 包里。Icons 属于 androidx.compose.material.icons，
+ * 而 `import androidx.compose.material3.*` 并不会带进来——
+ * 漏了它的表现是 Unresolved reference: Icons，而且只在这一处。
+ * 顺带一提：Extension / Security / VisibilityOff 属于 icons-extended（不是 core），
+ * 所以 build.gradle.kts 里必须挂 material-icons-extended 而不是 core。 */
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier

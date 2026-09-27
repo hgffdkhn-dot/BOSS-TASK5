@@ -1,0 +1,40 @@
+# BOSS · 版本目录
+#
+# ⚠️ 版本号需要按 Android 官网校准后再首次构建。
+#    这里给出的是写这份文件时的取值；AGP / Kotlin / Compose BOM 每个月都在动，
+#    照抄过期版本号的表现是 Gradle 直接报 "Could not find"。
+#
+# 唯一必须锁死的是 material3 = 1.5.0-alpha27：
+#    Material 3 Expressive 目前只有 alpha。官方明确过——1.4.0 是最后一个稳定版，
+#    Expressive API 在 1.5.0 才转稳定。**别用 BOM 覆盖掉它**：
+#    BOM 会把它拉回稳定版，于是 MaterialExpressiveTheme / MotionScheme
+#    全部 unresolved，报错信息完全不会提示"版本被 BOM 换掉了"。
+[versions]
+agp = "8.9.0"
+kotlin = "2.2.0"
+composeBom = "2026.08.00"
+material3 = "1.5.0-alpha27"
+activityCompose = "1.11.0"
+lifecycle = "2.9.0"
+coreSplashscreen = "1.0.1"
+
+[libraries]
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+androidx-core-splashscreen = { module = "androidx.core:core-splashscreen", version.ref = "coreSplashscreen" }
+androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+compose-material3 = { module = "androidx.compose.material3:material3", version.ref = "material3" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-foundation = { module = "androidx.compose.foundation:foundation" }
+# 图标必须挂 extended 而不是 core：Home 在 core 里，
+# 但 Extension / Security / VisibilityOff 只在 extended。
+# 挂错的报错是 "Unresolved reference: Extension"，不会提示换依赖。
+compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

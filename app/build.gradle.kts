@@ -72,6 +72,13 @@ dependencies {
     implementation(libs.compose.ui)
     implementation(libs.compose.foundation)
     implementation(libs.compose.material3)          // 版本锁死见 libs.versions.toml
+    // 图标：必须用 extended 而不是 core。
+    // Home 在 core 里，但 Extension / Security / VisibilityOff 只在 extended。
+    // 挂了 core 的表现是 "Unresolved reference: Extension"，
+    // 而它不会提示"换 extended 就好"，只会让人以为图标名写错了。
+    // 代价：extended 是全量图标集，APK 会大几百 KB。
+    // 想瘦身就把这三个换成 core 里确实存在的图标，然后改挂 core。
+    implementation(libs.compose.material.icons.extended)
     implementation(libs.compose.ui.tooling.preview)
     debugImplementation(libs.compose.ui.tooling)
 

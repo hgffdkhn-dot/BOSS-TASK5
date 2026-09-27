@@ -11,3 +11,13 @@ build/*
 # 所以这里用 build/* + 反向声明，只忽略产物、保住脚本。
 
 # 本地 vendor 的第三方源码不忽略（external/libsepol 是要随仓库走的）
+
+# --- 任务6：Android 客户端（Gradle）---
+# 注意与上面的 build/* 不冲突：那个是仓根 build/（BOSS 本体产物目录），
+# 这里是 Gradle 自己的产物目录。
+.gradle/
+app/build/
+.cxx/
+.externalNativeBuild/
+local.properties
+*.iml
