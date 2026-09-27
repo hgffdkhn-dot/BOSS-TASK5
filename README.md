@@ -1,15 +1,27 @@
-# BOSS · su + 关键组件（任务 2 / 任务 3）
+# BOSS · su + 关键组件 + 任务5（任务 2 / 3 / 4 / 5）
 
 Magisk 式 root 管理器 BOSS 的 su 子系统与关键组件：主打**隐蔽、日用、实用**。
 镜像注入交给上游的 veritpath。
 
+- **任务6（客户端）接手先看**：`docs/HANDOFF-TASK6-客户端.md`（操作手册：
+  三条硬约束、接口契约、别做错的事）
+- 任务5 的**交付说明**：`docs/TASK5-无修改系统逻辑与特典逻辑.md`（设计推演）
 - 方案解析与设计说明：`docs/BOSS-su-方案解析与设计.md`
 - **接力开发者先看**：`docs/HANDOFF-接力须知.md`（踩过的坑、架构红线、v0.2 实施手册）
 - 任务3（关键组件）的**任务书**：`docs/HANDOFF-TASK3-关键组件.md`
 - 任务3 的**交付说明**：`docs/TASK3-组件交付与接力.md`（已落地什么、怎么验、给下游的接口）
 - 给任务4 的 SELinux 权限清单：`docs/SELINUX-REQUIREMENTS.md`
-- **任务5 交付说明**：`docs/TASK5-无修改系统逻辑与特典逻辑.md`（systemless / hide / hijack 补完）
+- 任务4 的**交付说明**：`docs/TASK4-SELinux-解决与规则注入.md`
+- 任务5 的**交付说明**：`docs/TASK5-无修改系统逻辑与特典逻辑.md`（systemless / hide / hijack 补完）
 - 注入契约与真机流程：见文档第 8 节
+
+> ⚠️ **交接时的三条硬约束**（任务5 结束时仍然成立，详见 `docs/HANDOFF-TASK6-客户端.md`）：
+> 1. v0.2 的 init 接管**代码已补齐但只能真机验**。接手一台没验过的机器，
+>    第一件事是 `ls -l /proc/1/exe`，**不是写代码**。
+> 2. 改任何测试套件后，**root 与非 root 两种身份都要跑一遍**再提交——
+>    CI 的 runner 是非 root，只跑 root 会得出错误结论（这条真红过一次）。
+> 3. 仓库可能还没推上去：本地已 commit + 打 `v0.2.0` tag，
+>    建空仓与 push 需主办方执行 `bash PUSH-TO-GITHUB.sh`。
 
 ## 目录
 
