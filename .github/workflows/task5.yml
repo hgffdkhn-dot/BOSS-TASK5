@@ -1,0 +1,92 @@
+name: 任务5 验收（systemless / hide / hijack）
+
+# 任务5 的三套验收：
+#   systemless_test  无修改系统逻辑：清单解析、属性端到端、基线比对、零写入自检
+#   hide_test        特典：隐藏名单、挂载暴露面、摘挂载、守护进程、属性伪装
+#   hijack_test      v0.2 前置：SwitchRoot 劫持布置（dry run 无副作用 / 变砖保护）
+#
+# 与 ci.yml 的分工和 components.yml 一样：ci.yml 每次提交必跑，这里跑的是
+# 任务5 的边界与语义细节。
+#
+# 关键约束（照抄 components.yml 的教训）：GitHub runner 是**非 root**，
+# 而摘挂载在真机上需要 root。所以涉及 setns/umount 的检查必须标 SKIP，
+# 不许静默通过，也不许因为"提权失败"就让 CI 红掉——守护进程退出比失败更糟，
+# 这个教训任务3 已经栽过一次（坑 7）。
+#
+# 只使用 GitHub 官方 action。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  task5:
+    name: 任务5 深度验收（离线）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 无修改系统逻辑
+        run: bash tools/systemless_test.sh
+
+      - name: 特典逻辑
+        run: bash tools/hide_test.sh
+
+      - name: SwitchRoot 劫持布置
+        run: bash tools/hijack_test.sh
+
+      - name: 失败诊断
+        if: failure()
+        run: |
+          echo "--- 运行身份（非 root 时摘挂载相关检查会标 SKIP，属正常）---"
+          id
+          echo "--- BOSS 运行时目录 ---"
+          ls -l /tmp/boss-test 2>/dev/null || echo "(无)"
+          echo "--- 隐藏名单 ---"
+          cat /tmp/boss-test/denylist.conf 2>/dev/null || echo "(无)"
+          echo "--- 挂载快照 ---"
+          cat /tmp/boss-test/mount.log 2>/dev/null || echo "(无)"
+          echo "--- 属性伪装清单 ---"
+          cat /tmp/boss-test/props.conf 2>/dev/null || echo "(无)"
+          echo "--- 审计日志 ---"
+          cat /tmp/boss-test/boss.log 2>/dev/null || echo "(无)"
+
+      - name: 上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: task5-test-logs
+          path: /tmp/boss-test/boss.log
+          if-no-files-found: ignore
+
+  # 挂载表解析是任务5 两块功能的共同地基：verify 用它证明"改动只来自 /data"，
+  # hide 用它找暴露面。两边各解析一次，判定标准迟早漂移（一边认 tmpfs 覆盖、
+  # 另一边不认），症状是"verify 说干净、hide 却漏摘一条"。
+  # 这个 job 守住"只有一份解析"这件事。
+  mntinfo-guard:
+    name: 挂载解析单一来源自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 只应有一处读 mountinfo
+        run: |
+          # 只数 .c：boss.h 里那句是注释里的说明文字，不算实现
+          n=$(grep -rl "mountinfo" src/*.c | wc -l)
+          echo "读 mountinfo 的源文件数：$n"
+          if [ "$n" -ne 1 ]; then
+            echo "ERROR: 挂载表解析出现了第二份实现，判定标准会漂移"
+            grep -rn "mountinfo" src/*.c || true
+            exit 1
+          fi
+          echo "OK: 解析唯一（src/mntinfo.c）"
+
+      - name: 正常构建
+        run: |
+          make clean
+          make test
+          ./build/boss -V
+          ./build/boss --list | grep -q systemless
+          ./build/boss --list | grep -q hide

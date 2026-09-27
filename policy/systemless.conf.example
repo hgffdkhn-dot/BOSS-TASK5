@@ -1,0 +1,36 @@
+# BOSS · 无修改系统逻辑清单
+#
+# 这一份文件是"这台机器被改了什么"的**单一事实来源**。
+# 散在 service.d 里的脚本做不到自检，而自检不了的性质等于没有性质。
+#
+# 语法（# 开头是注释，空白会被忽略）：
+#   prop NAME VALUE       改属性值（默认走 property_service，会触发 on property:）
+#   prop -d NAME          删除属性（也接受 --delete）
+#   persist NAME VALUE    改 persist.* 并写入持久化存储
+#   deny NAME             加入隐藏名单（等价于 boss hide denylist add NAME）
+#
+# 阶段：
+#   boss systemless apply --stage post-fs-data   阻塞阶段，内部自动用 -n
+#   boss systemless apply --stage service        非阻塞阶段，可触发 rc 事件
+#
+# 红线：本清单只做**属性改写**与**挂载覆盖**两件事。
+# 任何要往 /system 落文件的需求都是越界——"无修改"是靠这条边界成立的。
+# 文件层覆盖请走模块（/data/adb/boss/modules/<id>/system/），不要用这里。
+
+# ---- 日用：关掉日志与调试痕迹（BOSS 主打隐蔽）----
+prop ro.debuggable 0
+prop ro.secure 1
+
+# ---- 按需：伪装为未解锁的 user 版 ----
+# 注意：这是检测面里的一层，不是全部；动态属性会被系统服务改回。
+# 想分开管理可以用 boss hide props 生成独立的 props.conf。
+# prop ro.build.type user
+# prop ro.boot.vbmeta.device_state locked
+# prop ro.boot.verifiedbootstate green
+# prop ro.boot.flash.locked 1
+# prop ro.boot.veritymode enforcing
+# prop sys.oem_unlock_allowed 0
+
+# ---- 隐藏名单 ----
+# deny com.example.bank
+# deny com.example.pay
