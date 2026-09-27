@@ -1,14 +1,17 @@
 #!/bin/bash
 # BOSS · 任务5 补完的 v0.2 前置：SwitchRoot 劫持布置（hijack-prep）
 #
-# 这一段是"能离机验的"与"必须真机验的"分界最清楚的地方：
-#   · 离机能验：命令存在、dry run 不落任何东西、非 root 下失败也不拖垮开机、
-#     真实 init 找不到时绝不 exec 自己（变砖保护）。
-#   · 离机验不了：真实的 SwitchRoot 结果。沙盒里 mount 需要特权，
-#     而且根本没有 SwitchRoot 可观察——本地最多验到"命令拼对了"。
+# ⚠️ 本脚本的第一版在 CI 上全红过，原因是踩了接力须知坑 7：
+#    `init` 这个 applet 标了 needs_root=1，非 root 下 applet 分发在调用 fn
+#    **之前**就返回 1。而 GitHub runner 是非 root——本地 root 全绿、CI 全红。
 #
-# 所以这里**不做**"假装验过挂载生效"的断言，只把能验的验死，
-# 剩下的明确标 SKIP 并在文档里写清真机判定方法（ls -l /proc/1/exe）。
+# 修法不是去改产品的 root 语义（needs_root 对真机 rc 脚本是正确的：
+# 非 root 时明确报错，不静默失败），而是让测试从 applet 层绕过去：
+#    tests/initkit.c 直接调 boss_init_main()，与 tests/sepolkit.c 同类做法。
+#   init 里真正需要特权的只有 mount，参数转发 / 变砖保护 / dry run 都不需要。
+#
+# 仍然只能真机验的：切根后的落点。沙盒没有内核、没有 SwitchRoot 可观察，
+# 本地最多验到"命令拼对了"。这部分明确标 SKIP，绝不假装验过。
 #
 # 运行：bash tools/hijack_test.sh
 set -u
@@ -24,94 +27,106 @@ UID_NOW=$(id -u)
 
 echo "== 构建 =="
 make test >/dev/null 2>&1 || { echo "构建失败"; exit 1; }
+make initkit >/dev/null 2>&1 || { echo "initkit 构建失败"; exit 1; }
 BIN=./build/boss
+KIT=./build/initkit
 TEST_DIR=/tmp/boss-test
-rm -rf "$TEST_DIR" 2>/dev/null
-mkdir -p "$TEST_DIR"
+mkdir -p "$TEST_DIR" 2>/dev/null
 
 echo
-echo "== 1. 子命令存在且可解析 =="
-$BIN init hijack-prep --dry >/dev/null 2>&1
-check "hijack-prep --dry 返回 0" "$?" "0"
-OUT=$($BIN init hijack-prep --dry 2>&1)
-echo "$OUT" | grep -q "would bind" && ok "dry run 说清了打算挂什么" || bad "dry run 输出不完整"
-echo "$OUT" | grep -q "/init.real" && ok "dry run 包含真实 init 备份这一步" || bad "缺 /init.real 备份说明"
+echo "== 1. needs_root 契约：非 root 下必须明确报错，不能静默失败 =="
+if [ "$UID_NOW" -eq 0 ]; then
+    skip "当前是 root，这一条要在非 root 下才验得到（CI 会验）"
+else
+    OUT=$($BIN init hijack-prep --dry 2>&1); RC=$?
+    check "applet 层拒绝并返回非 0" "$RC" "1"
+    echo "$OUT" | grep -q "需要 root" && ok "报错说清了原因" || bad "静默失败: $OUT"
+fi
 
 echo
-echo "== 2. dry run 不留痕迹（这条最重要）=="
-# 先记下基线：上一轮 test 3 的真跑会留下 /sdcard 与 /storage/self，
-# 那是**真跑**的产物，不能算到 dry 头上。所以这里比的是"有没有新增"，
-# 而不是"路径存不存在"——否则脚本跑第二遍就必然误报。
-BASE_SDCARD=0; BASE_SELF=0; BASE_LINK=0; BASE_REAL=0
-[ -e /sdcard ] && BASE_SDCARD=1
-[ -e /storage/self ] && BASE_SELF=1
-[ -L /storage/self/primary ] && BASE_LINK=1
-[ -e /init.real ] && BASE_REAL=1
-$BIN init hijack-prep --dry >/dev/null 2>&1
-NEW_SDCARD=0; NEW_SELF=0; NEW_LINK=0; NEW_REAL=0
-[ -e /sdcard ] && NEW_SDCARD=1
-[ -e /storage/self ] && NEW_SELF=1
-[ -L /storage/self/primary ] && NEW_LINK=1
-[ -e /init.real ] && NEW_REAL=1
-if [ "$BASE_LINK" != "$NEW_LINK" ] || [ "$BASE_REAL" != "$NEW_REAL" ]; then
-    bad "dry run 创建了符号链接或 init 备份"
-elif [ "$BASE_SDCARD" != "$NEW_SDCARD" ] || [ "$BASE_SELF" != "$NEW_SELF" ]; then
-    bad "dry run 新增了 /sdcard 或 /storage/self"
+echo "== 2. dry run：说清打算做什么 =="
+OUT=$($KIT hijack-prep --dry 2>&1); RC=$?
+check "dry run 返回 0" "$RC" "0"
+echo "$OUT" | grep -q "would bind" && ok "说清了打算挂什么" || bad "输出不完整"
+echo "$OUT" | grep -q "/init.real" && ok "包含真实 init 备份这一步" || bad "缺 /init.real 备份说明"
+
+echo
+echo "== 3. dry run 不留痕迹 =="
+# 比"有没有新增"而不是"路径存不存在"：第 5 项的真跑会留下 /sdcard
+# 与 /storage/self，那是真跑的产物，不能算到 dry 头上。
+B_LINK=0; B_REAL=0; B_SDCARD=0; B_SELF=0
+[ -L /storage/self/primary ] && B_LINK=1
+[ -e /init.real ] && B_REAL=1
+[ -e /sdcard ] && B_SDCARD=1
+[ -e /storage/self ] && B_SELF=1
+$KIT hijack-prep --dry >/dev/null 2>&1
+N_LINK=0; N_REAL=0; N_SDCARD=0; N_SELF=0
+[ -L /storage/self/primary ] && N_LINK=1
+[ -e /init.real ] && N_REAL=1
+[ -e /sdcard ] && N_SDCARD=1
+[ -e /storage/self ] && N_SELF=1
+if [ "$B_LINK" != "$N_LINK" ] || [ "$B_REAL" != "$N_REAL" ] ||
+   [ "$B_SDCARD" != "$N_SDCARD" ] || [ "$B_SELF" != "$N_SELF" ]; then
+    bad "dry run 产生了副作用"
 else
     ok "dry run 未产生任何新增副作用"
 fi
 
 echo
-echo "== 3. 非 root 下真跑：失败但不能拖垮开机 =="
-if [ "$UID_NOW" -ne 0 ]; then
-    timeout 20 $BIN init hijack-prep >/dev/null 2>&1
-    RC=$?
-    check "非 root 下仍返回 0（布置失败不该中断 init）" "$RC" "0"
-    skip "非 root：无法验真实 mount（沙盒没有 SwitchRoot 可观察）"
+echo "== 4. 布置失败不能中断 init（这条决定开不开得了机）=="
+if [ "$UID_NOW" -eq 0 ]; then
+    # 真跑会真的 bind mount /sdcard。在开发者本机上做这件事既危险又没意义，
+    # 而 root 环境下 mount 会成功，也验不到"失败"这条分支。
+    skip "root 环境：真跑会真的挂载 /sdcard，只在非特权环境（CI）验"
 else
-    # root 沙盒里 mount 可能仍然失败（没有 SwitchRoot 目标），只要求不挂死
-    timeout 20 $BIN init hijack-prep >/dev/null 2>&1
-    RC=$?
-    check "root 下真跑能返回（不挂死）" "$RC" "0"
-    skip "沙盒无法验切根后的落点，需真机：ls -l /proc/1/exe"
+    timeout 20 $KIT hijack-prep >/dev/null 2>&1; RC=$?
+    check "mount 失败仍返回 0（init 不会被拖住）" "$RC" "0"
 fi
 
 echo
-echo "== 4. 变砖保护：找不到真实 init 时绝不 exec 自己 =="
-# BOSS_INIT_REAL 指向不存在的文件时，stage2 必须返回 127 而不是自杀式循环
-BOSS_INIT_REAL=/nonexistent/real-init timeout 20 $BIN init stage2 second_stage >/dev/null 2>&1
-RC=$?
-check "找不到真实 init 返回 127" "$RC" "127"
+echo "== 5. 变砖保护：找不到真实 init 时绝不 exec 自己 =="
+BOSS_INIT_REAL=/nonexistent/real-init timeout 20 $KIT stage2 second_stage >/dev/null 2>&1
+check "返回 127（没有 exec 自己造成死循环）" "$?" "127"
 
 echo
-echo "== 5. 阶段参数不能丢（丢了就开机循环）=="
+echo "== 6. 阶段参数不能丢（丢了就开机循环）=="
 FAKE=$TEST_DIR/fakeinit.sh
 cat > "$FAKE" <<'EOF'
 #!/bin/bash
 echo "$@" > /tmp/boss-test/args.txt
 EOF
 chmod +x "$FAKE"
-BOSS_INIT_REAL="$FAKE" timeout 20 $BIN init stage2 second_stage >/dev/null 2>&1
+rm -f "$TEST_DIR/args.txt"
+
+BOSS_INIT_REAL="$FAKE" timeout 20 $KIT stage2 second_stage >/dev/null 2>&1
 if [ -f "$TEST_DIR/args.txt" ]; then
-    grep -q "second_stage" "$TEST_DIR/args.txt" && ok "second_stage 被转发给真实 init" || bad "阶段参数丢失"
+    grep -q "second_stage" "$TEST_DIR/args.txt" \
+        && ok "second_stage 原样转发给真实 init" || bad "阶段参数丢失"
 else
-    skip "假 init 未被调用（沙盒里 /data 不可用，属预期）"
+    bad "假 init 未被调用（execv 这条链路断了）"
 fi
-BOSS_INIT_REAL="$FAKE" timeout 20 $BIN init selinux_setup >/dev/null 2>&1
+
+rm -f "$TEST_DIR/args.txt"
+BOSS_INIT_REAL="$FAKE" timeout 20 $KIT selinux_setup >/dev/null 2>&1
 if [ -f "$TEST_DIR/args.txt" ]; then
     grep -qE "selinux_setup|second_stage" "$TEST_DIR/args.txt" \
-        && ok "selinux_setup 被接住且传了合法阶段参数" || bad "selinux_setup 分支参数异常"
+        && ok "selinux_setup 被接住，且传的是合法阶段参数" || bad "参数异常"
 else
-    skip "假 init 未被调用"
+    bad "selinux_setup 分支没走到 execv"
 fi
 
 echo
-echo "== 6. cmdline 自救开关仍在 =="
+echo "== 7. 自救开关 =="
 if [ -r /proc/cmdline ]; then
     ok "cmdline 可读（真机上 boss_selinux=0 可现场退回原厂路径）"
 else
     skip "沙盒无 /proc/cmdline"
 fi
+
+# 测试过程中 start_daemon() 可能拉起过 bossd，留着会占住抽象套接字，
+# 影响后续套件（表现为 Address already in use）
+pkill -x boss >/dev/null 2>&1
+pkill -x initkit >/dev/null 2>&1
 
 echo
 echo "结果：PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

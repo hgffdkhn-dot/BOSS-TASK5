@@ -34,6 +34,13 @@ jobs:
       - name: 特典逻辑
         run: bash tools/hide_test.sh
 
+      # 三套都按"非 root"设计：runner 是普通用户，需要 root 的检查会明确标
+      # SKIP，绝不静默通过，也绝不因为提权失败就让 CI 红掉。
+      #
+      # ⚠️ 改任何一套之后，请以**两种身份**各跑一遍再提交（坑 7）：
+      #   bash tools/xxx_test.sh                                        # root
+      #   setpriv --reuid=65534 --regid=65534 --clear-groups bash ...   # 非 root
+      # 只跑一种会得出错误结论——CI 用的是非 root 那一份。
       - name: SwitchRoot 劫持布置
         run: bash tools/hijack_test.sh
 

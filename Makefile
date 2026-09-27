@@ -118,6 +118,23 @@ sepol:
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $(SEPOL_OUT) $(SRCS) $(LDLIBS)
 	@echo "产物: $(SEPOL_OUT)（已内置 libsepol 后端，engine 显示为 libsepol）"
 
+# 测试专用小工具：绕开 applet 层的 needs_root 闸门，直接调 boss_init_main。
+#
+# 为什么需要：`init` 标了 needs_root=1（真机上由 rc 以 root 调起，非 root 时
+# 明确报错是正确语义），但这条闸门挡在 fn 之前，导致 GitHub runner（非 root）
+# 上一个 init 不变量都验不到——本地 root 全绿、CI 全红（接力须知坑 7）。
+# init 里真正需要特权的只有 mount，参数转发 / 变砖保护 / dry run 都不需要，
+# 所以让测试从 applet 层绕过去，而不是去改产品的 root 语义。
+#
+# BOSS_DIR 与 `make test` 一致：这些用例会写 /tmp/boss-test。
+# 同样无条件重新链接（见 test 目标的注释）。
+initkit: EXTRA_CFLAGS += -DBOSS_DIR='"/tmp/boss-test"'
+initkit:
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o build/initkit tests/initkit.c \
+	    $(filter-out src/main.c,$(SRCS)) $(LDLIBS)
+	@echo "产物: build/initkit（测试用，不进主构建）"
+
 # 测试专用小工具：造一个能被 policydb_read 读回的最小 kernel policy。
 # 沙盒/CI 上没有真机的 precompiled_sepolicy，也没有 checkpolicy 能现编一个，
 # 所以内置后端要端到端地验，只能自己搭。不进主构建。
@@ -136,6 +153,6 @@ sepol-check:
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $(SEPOL_OUT) $(SRCS) $(LDLIBS)
 
 clean:
-	rm -rf build/boss build/boss-static build/boss-sepol build/sepolkit build/out
+	rm -rf build/boss build/boss-static build/boss-sepol build/sepolkit build/initkit build/out
 
-.PHONY: all test android-arm64 android-sepol rules sepol sepol-check sepolkit clean
+.PHONY: all test android-arm64 android-sepol rules sepol sepol-check sepolkit initkit clean

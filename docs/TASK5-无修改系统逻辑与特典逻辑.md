@@ -202,7 +202,18 @@ BOSS 主打隐蔽是产品定位，但"隐蔽"不等于"欺骗用户"。
    没目标时就不该有动作。
 5. **`resetprop` 读出来是 `[ro.debuggable]: [0]` 这种格式**，
    测试里按整行相等断言必然失败。要按值匹配。
-6. **清理构建产物别用 `rm -rf build`。** 我在收尾时顺手这么干了一次，
+6. **`needs_root=1` 会让整个 init 子系统在 CI 上验不到。**（这条是 CI 真红过之后才发现的）
+   `init` 标了 `needs_root=1`，而非 root 下 applet 分发在调用 fn **之前**就返回 1
+   ——GitHub runner 是非 root，于是参数转发、变砖保护、dry run 一个都跑不到，
+   表现为"本地 root 全绿、CI 全红"。就是接力须知坑 7 说的那句话，我自己又踩了一遍。
+   修法**不是**去改产品的 root 语义（对真机 rc 脚本来说它是正确的：非 root 明确报错、
+   不静默失败），而是让测试从 applet 层绕过去——`tests/initkit.c` 直接调
+   `boss_init_main()`，与 `tests/sepolkit.c` 同类做法。init 里真正需要特权的只有
+   mount，其余逻辑根本不需要 root。
+7. **测试里别在 root 环境真跑 `hijack-prep`。** 它会真的 bind mount `/sdcard`
+   ——在开发者本机上既危险又没意义，而且 root 下 mount 会成功，反而验不到
+   "失败也不中断 init"这条分支。这条只在非特权环境（CI）验。
+8. **清理构建产物别用 `rm -rf build`。** 我在收尾时顺手这么干了一次，
    把 `build/build-ndk.sh` 一起删了——**就是 `.gitignore` 注释里警告的那个坑**，
    只不过从"提交不上去"变成了"文件没了"。CI 的 android job 第一步就调它，
    而且本地永远是绿的（脚本一直躺在自己的工作区里，只有别人 clone 下来才炸）。
@@ -272,7 +283,10 @@ BOSS 主打隐蔽是产品定位，但"隐蔽"不等于"欺骗用户"。
 | 属性伪装的持久性 | 依赖机型 | 动态属性会被系统服务改回；`persist.*` 需配合 `-p` |
 | hexpatch 退路 | 大概率永不触发 | `/init` 正在执行时 `open(O_RDWR)` 会 ETXTBSY，它本是**离线 patch 镜像**用的手段，运行时基本做不到 |
 
-**沙盒里已经验到的**（7 套，共 136 项，含任务5 新增 42 项）：
+**沙盒里已经验到的**（7 套，共 138 项，含任务5 新增 44 项）。
+
+⚠️ 以下统计是**非 root 与 root 两种身份都跑过**的结果——只跑一种会得出错误结论
+（见第 5 节坑 6）。CI 的 runner 是非 root，所以以非 root 那一份为准。
 
 | 套件 | 项数 | 覆盖 |
 |---|---|---|
@@ -282,7 +296,7 @@ BOSS 主打隐蔽是产品定位，但"隐蔽"不等于"欺骗用户"。
 | `stage2_test.sh` | 6 | 原有 init 接线回归 |
 | `systemless_test.sh` | 16 | 清单解析容错、dry run 无副作用、属性端到端、基线比对、返回码 |
 | `hide_test.sh` | 17 | 名单增删幂等、暴露面清单、摘挂载、守护 `--once` 必退出、模板边界说明 |
-| `hijack_test.sh` | 9 | dry run 无副作用、非 root 不拖垮开机、变砖保护、阶段参数不丢 |
+| `hijack_test.sh` | 11 | dry run 内容、dry run 无副作用、mount 失败不中断、变砖保护 127、阶段参数不丢、needs_root 契约 |
 
 ---
 
@@ -325,6 +339,6 @@ payload/init.boss.rc       on early-init 触发 hijack-prep（切根前）
 policy/systemless.conf.example  清单模板
 tools/systemless_test.sh   16 项验收
 tools/hide_test.sh         17 项验收
-tools/hijack_test.sh       9 项验收
+tools/hijack_test.sh       11 项验收
 .github/workflows/task5.yml  任务5 CI + 挂载解析单一来源自检
 ```

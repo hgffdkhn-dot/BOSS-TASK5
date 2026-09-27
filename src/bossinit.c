@@ -250,6 +250,13 @@ static int early_sepol_inject(void)
  */
 static void spawn_boot_waiter(void)
 {
+    /* 离机验证时不派发等待者。BOSS_INIT_REAL 是 tools/stage2_test.sh 的
+     * 测试开关（真机上 init 传下来的环境是空的，它不可能被意外带上）。
+     * 不拦这一下的后果：每次跑测试都会在后台留下一个最长 60 秒的轮询进程，
+     * 而且它一旦判定 /data 就绪就会真跑一整套 `boss boot post-fs-data`
+     * ——在 CI runner 上等于把模块挂载和脚本都执行了一遍。 */
+    if (getenv("BOSS_INIT_REAL")) return;
+
     /* /dev 是 tmpfs：标记随重启消失，天然不会跨开机误判 */
     if (access("/dev/.boss_boot", F_OK) == 0) return;
     int fd = open("/dev/.boss_boot", O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
