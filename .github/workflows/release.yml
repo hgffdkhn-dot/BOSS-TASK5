@@ -57,14 +57,70 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: 版本链自检（先看清版本，再编）
+        # 为什么要有这一步：AAR 元数据校验失败时会甩出 29 条
+        # "requires AGP 9.1.0 / requires compileSdk 37"，而真实原因往往只有一条——
+        # **推上去的仓库是旧的**（比如 AGP 还停在 8.9.0）。
+        # 那 29 条里没有任何一条会告诉你"你编的是旧代码"。
+        # 所以先把版本原样打出来、并对着下限做一次硬校验，
+        # 版本不对就在这一步停掉，别等一分钟后看那面报错墙。
+        env:
+          GRADLE_VER: ${{ vars.GRADLE_VER || '9.3.1' }}
+        run: |
+          echo "=== gradle/libs.versions.toml 的实际取值 ==="
+          grep -E '^(agp|kotlin|composeBom|material3) *=' gradle/libs.versions.toml || {
+            echo "ERROR: 读不到版本目录——推上去的仓库不对，或者 gradle/ 没提交进来"; exit 1; }
+
+          agp=$(grep -m1 -E '^agp *=' gradle/libs.versions.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          cs=$(grep -m1 -E '^ *compileSdk *=' app/build.gradle.kts | grep -oE '[0-9]+')
+
+          echo
+          echo "AGP        = ${agp:-未读到}"
+          echo "compileSdk = ${cs:-未读到}"
+          echo "Gradle     = $GRADLE_VER（本 job 要用）"
+
+          ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+          [ -n "$agp" ] || { echo "ERROR: 没读到 agp 版本"; exit 1; }
+          ver_ge "$agp" "9.1.0" || {
+            echo "ERROR: AGP $agp < 9.1.0。"
+            echo "       Compose 1.12.0 的 AAR 要求 AGP ≥ 9.1.0（硬校验，压不掉）。"
+            echo "       如果是刚推完就跑的，先确认推的是最新那份——"
+            echo "       这一步最常撞上的其实就是'推上去的还是旧仓库'。"; exit 1; }
+
+          [ "$cs" = "37" ] || echo "[warn] compileSdk=$cs（期望 37）。若 AAR 校验报需要 37，改 app/build.gradle.kts。"
+
+          ver_ge "$GRADLE_VER" "9.3.1" || {
+            echo "ERROR: Gradle $GRADLE_VER < 9.3.1，AGP 9.1.1 的硬下限。"; exit 1; }
+
+      - name: 装 SDK 平台 37 与 Build Tools 36.0.0
+        # 必须装：compileSdk 37 需要 android-37 平台，AGP 9.1.1 需要 Build Tools 36.0.0。
+        # runner 镜像通常只预装到 36，不装的话报错是
+        # "Failed to find target with hash string 'android-37'"——
+        # 它不会提示"去装个平台"。
+        run: |
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+          SM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          SM=${SM:-$(command -v sdkmanager)}
+          [ -n "$SM" ] || { echo "ERROR: 找不到 sdkmanager"; exit 1; }
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" --install "platforms;android-37" "build-tools;36.0.0" >/dev/null
+          echo "已装平台："; ls "$SDK"/platforms
+          echo "已装 build-tools："; ls "$SDK"/build-tools
+
       - name: 取一个确定版本的 Gradle
         # 仓库里没有 gradlew wrapper —— wrapper 的 jar 是二进制，我这边生成不了。
         # 所以显式下载固定版本，而不是依赖 runner 预装的 gradle：
         # 预装版本与 AGP 要求不符时，报错是 "Minimum supported Gradle version is ..."，
         # 而它不会告诉你该装哪个。钉死在这里改起来更直接。
-        # 改 gradle/libs.versions.toml 里的 agp 时，记得同步这里的 GRADLE_VER。
+        #
+        # ⚠️ 9.3.1 是 AGP 9.1.1 的**硬下限**（官方兼容表）。
+        #    改 gradle/libs.versions.toml 里的 agp 时，必须同步这里的 GRADLE_VER——
+        #    这两处不一致，会在 sync 阶段就挂掉。
+        env:
+          GRADLE_VER: ${{ vars.GRADLE_VER || '9.3.1' }}
         run: |
-          GRADLE_VER=8.11.1
+          echo "下载 Gradle $GRADLE_VER"
           cd /tmp
           curl -sSLO "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip"
           unzip -q "gradle-${GRADLE_VER}-bin.zip"

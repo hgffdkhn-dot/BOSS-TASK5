@@ -7,17 +7,45 @@
 //   2. minSdk 26 对齐 payload/manifest.json 的 min_api。
 plugins {
     alias(libs.plugins.android.application)
+    /* AGP 9.x 起 Kotlin 编译被内置进 AGP，官方说法是"不用手动加 kotlin.android"。
+     * 这里仍然显式声明，是为了让版本目录里的 kotlin = 2.3.0 生效
+     * （AGP 内置的 KGP 是 2.2.10，低于我们指定的会自动升上来）。
+     *
+     * ⚠️ 如果 sync 时报 Kotlin 插件版本冲突，第一件事是把下面这行注释掉，
+     *    让它完全交给 AGP 内置的那一份——而不是去降 Kotlin 版本。 */
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
 
 android {
     namespace = "com.boss.manager"
-    compileSdk = 36          // Android 16：edge-to-edge 与预测式返回在这个级别上是强制的
+
+    /* compileSdk 为什么是 37 而不是 36：
+     *   不是我们想用 API 37 的新接口，是**被依赖逼的**——
+     *   Compose BOM 2026.08.00 把 ui/foundation 锁在 1.12.0，而 1.12.0 的
+     *   AAR 元数据里写着 "requires compileSdk 37 / requires AGP 9.1.0"。
+     *   于是 checkDebugAarMetadata 直接硬失败（29 个问题），不是警告。
+     *
+     *   ⚠️ 如果报 "Failed to find target with hash string 'android-37'"：
+     *      API 37 在某些 SDK 版本里只以次要版本形式发行（android-37.0 / 37.1），
+     *      这时需要在下面补一行 compileSdkMinor = 0（要求 AGP ≥ 9.1.0）。
+     *      我们没默认写它，因为多数环境下写了反而找不到目标。
+     *
+     *   另：本地必须先装好 android-37 平台 + SDK Build Tools 36.0.0，
+     *   否则 AGP 连目标都找不到。 */
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.boss.manager"
         minSdk = 26
+        /* targetSdk 刻意留在 36，不跟着 compileSdk 走。
+         * 这三者是独立的（错误提示原文也这么说了）：
+         *   compileSdk —— 能用哪些新 API（被依赖逼着升）
+         *   targetSdk  —— 采不采用新的运行时行为（Android 16 的 edge-to-edge
+         *                  与预测式返回在 36 上已经是强制的，够用了）
+         *   minSdk     —— 能装到哪些设备上（26，对齐 payload 的 min_api）
+         * 把 targetSdk 一起推到 37 会引入一批新的运行时行为变更，
+         * 而这些变更我们一行都没验过。别顺手改。 */
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"

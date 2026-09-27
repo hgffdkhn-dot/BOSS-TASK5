@@ -88,6 +88,16 @@ bash tools/manager_flow_test.sh # 任务6：manager 身份 + 授权弹窗（14 �
 bash tools/contract_test.sh     # 任务6：CLI 输出契约（App 解析器的护栏，18 项）
 ```
 
+**编 APK 之前先跑**（不需要 Android SDK）：
+
+```bash
+bash tools/check_android_toolchain.sh
+```
+
+它会把 AGP / Kotlin / BOM / material3 / compileSdk / targetSdk 打出来并对着下限校验。
+AAR 元数据校验失败时会甩出二三十条 "requires AGP 9.1.0 / requires compileSdk 37"，
+而真实原因往往只是版本链上某一节没跟上——这个脚本直接指出是哪一节。
+
 ```bash
 git tag v0.1.0 && git push origin v0.1.0    # 打 tag 自动出 Release（含 payload zip）
 ```

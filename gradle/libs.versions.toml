@@ -1,17 +1,42 @@
 # BOSS · 版本目录
 #
 # ⚠️ 版本号需要按 Android 官网校准后再首次构建。
-#    这里给出的是写这份文件时的取值；AGP / Kotlin / Compose BOM 每个月都在动，
-#    照抄过期版本号的表现是 Gradle 直接报 "Could not find"。
 #
-# 唯一必须锁死的是 material3 = 1.5.0-alpha27：
+# ---------------------------------------------------------------------------
+# 这四个版本是一条链，动一个必须一起动（chain，不是四个独立数字）：
+#
+#   compileSdk 37  ──需要──►  AGP ≥ 9.1.1  ──需要──►  Gradle ≥ 9.3.1
+#        ▲                        │
+#        │                        └──内置──►  KGP 2.2.10（低于它会自升）
+#        │
+#        └──被谁逼的：Compose BOM 2026.08.00 把 ui/foundation 锁在 1.12.0，
+#                     1.12.0 的 AAR 元数据声明 "compileSdk ≥ 37 + AGP ≥ 9.1.0"
+#
+# 第一次构建就撞在最后一条上：checkDebugAarMetadata 报 29 个问题，
+# 全部是 "requires compileSdk 37 / requires AGP 9.1.0"。
+# 注意这不是警告、不是报错，而是 **AAR 元数据硬校验**，绕不过去。
+#
+# ⚠️ 别用 android.suppressUnsupportedCompileSdk 去压。
+#    它压的是另一件事（"AGP 只测试到 compileSdk 35" 的提醒），
+#    压完这 29 个 AAR 校验照样失败。它只会让真正的错误信息消失得更早。
+#
+# ---------------------------------------------------------------------------
+# material3 仍然锁死 1.5.0-alpha27：
 #    Material 3 Expressive 目前只有 alpha。官方明确过——1.4.0 是最后一个稳定版，
 #    Expressive API 在 1.5.0 才转稳定。**别用 BOM 覆盖掉它**：
 #    BOM 会把它拉回稳定版，于是 MaterialExpressiveTheme / MotionScheme
 #    全部 unresolved，报错信息完全不会提示"版本被 BOM 换掉了"。
+#
+#    代价就是要跟着吃 compileSdk 37 这条链。官方说过 1.5.0 会在 2026 年内转稳定，
+#    转稳后（以及 BOM 跟进后）这条链可能重新松动，届时再回来校准。
 [versions]
-agp = "8.9.0"
-kotlin = "2.2.0"
+# AGP 9.1.1 是官方声明"支持 API 37.0 及以下"的版本（AGP 9.0.x 最高只接受 36）。
+agp = "9.1.1"
+# Kotlin 2.3 与 AGP 9.x 配对有个隐藏下限：AGP 9.0.28 之前不支持 Kotlin 2.3。
+# 9.1.1 > 9.0.28，安全。另外 AGP 9.x 内置了 KGP，低于 2.2.10 会自动升。
+kotlin = "2.3.0"
+# CI 的 release.yml 里 GRADLE_VER 必须与 AGP 9.1.1 的 Gradle 下限对齐（9.3.1）。
+# 仓库没有 gradlew wrapper（wrapper jar 是二进制），所以那里是手工下载的。
 composeBom = "2026.08.00"
 material3 = "1.5.0-alpha27"
 activityCompose = "1.11.0"

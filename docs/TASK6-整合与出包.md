@@ -160,6 +160,114 @@
 
 ---
 
+## 4.5 第一次真编译撞上的坑：工具链是一条链，不是一个数字
+
+实际跑 `gradle :app:assembleDebug` 时，在 `checkDebugAarMetadata` 挂了，
+报 **29 个问题**，形如：
+
+```
+依赖项 "androidx.compose.material3:material3-ripple-android:1.5.0-alpha27"
+  需要依赖它的库/应用针对 Android API 37 或更高版本编译
+  需要 Android Gradle 插件 9.1.0 或更高版本
+:app 目前是针对 android-36 编译的，AGP 是 8.9.0
+```
+
+同时 Gradle 还友好地建议：`请添加 android.suppressUnsupportedCompileSdk=36`。
+
+**这条建议是陷阱，别听。** 它压的是另一件事（"AGP 只测试到 compileSdk 35"的提醒），
+与这 29 个问题无关。这 29 个是 **AAR 元数据硬校验**——不是警告、不是 lint，
+加了那行之后警告没了、29 个问题一个不少，还少了一条线索。
+
+### 真实成因：一条四节的版本链
+
+```
+Compose BOM 2026.08.00 把 ui/foundation 锁到 1.12.0
+        └─► 1.12.0 的 AAR 声明 "compileSdk ≥ 37 + AGP ≥ 9.1.0"
+                └─► compileSdk 37 需要 AGP ≥ 9.1.1（AGP 9.0.x 最高只收 36）
+                        └─► AGP 9.1.1 需要 Gradle ≥ 9.3.1
+```
+
+**动一个必须一起动。** 所以不是"把 compileSdk 改成 37"就完了——
+只改那一个数字会得到 "Minimum supported Gradle version is ..." 之类的下一层报错。
+
+最终取值（已写进 `gradle/libs.versions.toml`）：
+
+| 项 | 原 | 现 | 为什么 |
+|---|---|---|---|
+| `agp` | 8.9.0 | **9.1.1** | 官方声明支持 API 37.0 及以下的版本 |
+| `kotlin` | 2.2.0 | **2.3.0** | AGP 9.x 内置 KGP；Kotlin 2.3 要求 AGP ≥ 9.0.28，9.1.1 安全 |
+| Gradle（CI） | 8.11.1 | **9.3.1** | AGP 9.1.1 的硬下限 |
+| `compileSdk` | 36 | **37** | 被依赖逼的 |
+| `targetSdk` | 36 | **36（不动）** | 见下 |
+
+**targetSdk 刻意不跟。** 这三者是独立的：compileSdk 管"能调哪些新 API"，
+targetSdk 管"采不采用新运行时行为"。Android 16 的 edge-to-edge 与预测式返回
+在 36 上已经是强制的，够用了；推到 37 会引入一批**我们一行都没验过**的行为变更。
+
+### 本地要做的两件事（CI 已经写好了，本地得自己做）
+
+```bash
+# 1) 装 android-37 平台 + Build Tools 36.0.0（不装的话 AGP 连目标都找不到）
+sdkmanager --install "platforms;android-37" "build-tools;36.0.0"
+
+# 2) Gradle 升到 9.3.1+（仓库没有 gradlew wrapper，wrapper jar 是二进制）
+```
+
+⚠️ 万一报 `Failed to find target with hash string 'android-37'`：
+某些 SDK 版本里 API 37 只以次要版本形式发行（`android-37.0`），
+这时要在 `android {}` 里补一行 `compileSdkMinor = 0`（要求 AGP ≥ 9.1.0）。
+我们没默认写它——多数环境下写了反而找不到目标。
+
+### 先确认你编的是不是最新那份（这一步最常撞上）
+
+报错里那句 `This build currently uses Android Gradle plugin 8.9.0` 是**关键线索**——
+它说的是**当前这份代码里**的 AGP，不是你机器上的。仓库里已经是 9.1.1，
+所以出现 8.9.0 基本等于：**推上去的还是旧包（或本地没拉新）**。
+
+先在仓库里自查，比看那面报错墙快得多：
+
+```bash
+bash tools/check_android_toolchain.sh
+```
+
+它会把 AGP / Kotlin / BOM / material3 / compileSdk / targetSdk 原样打出来，
+对着下限逐条校验，版本不对当场指出是哪一行。不需要 Android SDK 也能跑。
+
+```
+agp        = 9.1.1        ← 如果是 8.9.0，说明推的是旧包
+compileSdk = 37
+targetSdk  = 36
+结果：PASS
+```
+
+CI 的 apk job 里也有同一段自检，而且放在**编译之前**——
+版本不对就在那一步停掉，不用等一分钟后看那 29 条。
+
+### 如果装不了 android-37，还有一条退路
+
+把整条 Compose 栈降回不要求 37 的组合：
+
+| 项 | 降为 |
+|---|---|
+| `composeBom` | `2026.06.00`（锁 Compose 1.11.x，不要求 compileSdk 37） |
+| `material3` | `1.4.0` 稳定版 |
+| `compileSdk` | `36` |
+| `agp` | `8.9.1`+（够用了，Gradle 8.11.1 即可） |
+
+⚠️ 真正的代价在代码里，不只是版本号：**Material 3 Expressive 会整个没了。**
+`MaterialExpressiveTheme` / `MotionScheme` / `LoadingIndicator` 全部不可用，
+`ui/theme/Theme.kt` 得退回普通 `MaterialTheme`，`ui/MainActivity.kt` 里的
+`LoadingIndicator` 也得换成 `LinearProgressIndicator`。
+
+⚠️ 另外别以为"只降 BOM、留着 material3 alpha27"能两全——
+alpha27 本身就依赖 Compose 1.12.0，降了 BOM 会和它打起来，
+症状是依赖冲突而不是 AAR 校验失败，更难查。
+
+要不要吃这个代价是产品决策，不是技术决策——所以**先试升工具链，升不动再谈降级**。
+真要走这条路，把上面那张表的四个值改掉之后说一声，我把 `Theme.kt` 一起改过去。
+
+---
+
 ## 5. 三条别做错的事
 
 - **别把 APK 塞进 payload。** 写系统分区违反无修改原则，这是 BOSS 的定位底线。
