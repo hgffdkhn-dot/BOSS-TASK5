@@ -18,11 +18,24 @@
 
 static void usage(const char *me)
 {
-    fprintf(stderr, "用法: %s ui <op> | run <cmd>\n", me);
+    fprintf(stderr, "用法: %s ui <op> | run <cmd> | selftest\n", me);
 }
 
 int main(int argc, char **argv)
 {
+    /* 自举：不连 daemon，只证明"这个二进制能被目标 uid 真正 exec 起来"。
+     *
+     * 为什么需要它：CI 上出现过——探针编译成功了，但被 setpriv 切成别的 uid
+     * 之后 exec 报 `cannot execute: Permission denied`（多半是 umask/权限位，
+     * 或工作区挂载带 noexec）。那种情况下后面 9 个用例会全部 FAIL，
+     * 而真实原因只是"二进制跑不起来"——又是那种指向错误方向的报错。
+     * 所以脚本在正式开跑之前，先用每个目标 uid 空跑一次这个模式。 */
+    if (argc >= 2 && strcmp(argv[1], "selftest") == 0) {
+        printf("code=SELFTEST exit=0 timeout=0\n");
+        printf("--- output ---\nprobe-ok\n");
+        return 0;
+    }
+
     if (argc < 3) { usage(argv[0]); return 2; }
 
     struct boss_ipc_opts o;

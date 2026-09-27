@@ -82,6 +82,21 @@ cc -std=c11 -Wall -Wextra -Wno-unused-parameter \
 }
 "$BUILD/ipc_layout_test" || exit 1
 
+# 产物必须能被非 root 身份 exec：容器化 runner 的工作区可能挂了 noexec，
+# 那种情况下 ipc_host_test 在第 3 步会直接 Permission denied。
+# 这里用 root 自己先试一次（noexec 不看 uid，root 一样跑不了），
+# 不行就换 /tmp 重编——总比报一堆指向错误方向的 FAIL 强。
+if ! "$BUILD/ipc_host_test" >/dev/null 2>&1 && [ "$BUILD" != "/tmp/boss-ipc-build" ]; then
+    echo "[i] $BUILD 里的二进制跑不起来，换到 /tmp 重编"
+    BUILD=/tmp/boss-ipc-build
+    mkdir -p "$BUILD"
+    ( cd "$BUILD" && cc -O1 -std=c11 -w -DBOSS_DIR="\"$TESTDIR\"" \
+        -o "$BUILD/boss-ipc-fixture" "$BOSS_SRC"/*.c -ldl 2>/dev/null
+      cc -O1 -std=c11 -w -I"$ROOT/app/src/main/cpp" -I"$BOSS_SRC" \
+        -o "$BUILD/ipc_host_test" "$HERE/ipc_host_test.c" \
+        "$ROOT/app/src/main/cpp/boss_ipc.c" )
+fi
+
 echo
 echo "=== 2) 端到端链路 ==="
 cc -std=c11 -Wall -Wextra -Wno-unused-parameter \

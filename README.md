@@ -1,6 +1,18 @@
 # BOSS · 全量包（任务 2 / 3 / 4 / 5 / 6）
 
 > **这是一个全量包**：BOSS-TASK5 的全部内容 + 任务6 的增量。
+>
+> ⚠️ **本仓【不含】计划表第 1 项的 veritpath。**
+> 它是 1 号的独立仓库 `hgffdkhn-dot/veritpath.git`，不在这里，也不需要在这里——
+> 两者的关系是"输入 / 工具"而不是"包含"：
+>   本仓**产出** `build/payload`（manifest.json + init.boss.rc + boss 二进制），
+>   veritpath **消费**这个 payload 去分析 boot 并注入镜像。
+> CI 的 payload job 会现取现编（`git clone --depth 1 $VP_REPO`，地址见
+> `.github/workflows/ci.yml` 的 `VP_REPO`，可用 repo variable 换源），
+> 然后跑 payload-check → inject → verify → unpack 一整条。
+> **交付给第三方时，veritpath 要单独给一份。**
+> （另：`payload/manifest.json` 里那个 `/veritpath/boss` 是镜像内的**冗余放置路径**，
+>  `required: false`，与工具本身无关，别被同名误导。）
 > 前辈的文件一份都没删，只做增量添加与修改。两种用法：
 >   · 覆盖式推到 `BOSS-TASK5`（推荐，单一事实来源）
 >   · 或推到新仓 `BOSS-TASK6`（前辈存档原样保留）
@@ -208,7 +220,7 @@ boss ping                       探活
 | 3. 其他关键文件与重要组件 | ✅ 已交付（resetprop / 模块挂载 / boot 脚本 / sepolicy 工具 / 工具集 / 开机编排） |
 | 4. SELinux 解决 | ✅ 已交付（255 条规则 + 引擎 + 早期注入接线，未上真机） |
 | 5. 无修改系统逻辑与特典逻辑 | ✅ 已交付（systemless / hide / hijack 补完，部分需真机验） |
-| 6. BOSS 客户端与对接修补 | ⬜ |
+| 6. BOSS 客户端与对接修补 | ✅ 已交付（App + manager 身份 + 授权弹窗；真机待验）|
 | 7. 长期开发 | ⬜ |
 
 已知最大限制：v0.2 的 init 接管（SwitchRoot 劫持）**代码已补齐但只能在真机验**。

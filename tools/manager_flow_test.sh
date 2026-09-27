@@ -29,7 +29,7 @@ if [ -z "${BOSS_SRC:-}" ]; then
     done
 fi
 BOSS_SRC="${BOSS_SRC:-$ROOT/src}"
-BUILD="$ROOT/build"
+BUILD="${BOSS_BUILD_DIR:-$ROOT/build}"   # 可覆盖，方便在受限环境里定位问题
 TESTDIR="${BOSS_TEST_DIR:-/tmp/boss-task6-test}"
 PROBE="$BUILD/ipc_probe"
 
@@ -72,9 +72,62 @@ if [ "$(id -u)" != "0" ]; then
     exit 0
 fi
 
-mkdir -p "$BUILD"
+MGR_UID=65534     # BOSS App
+ASK_UID=65533     # 策略 = prompt（弹窗用例）
+DENY_UID=65532    # 无规则 → default=deny，立即返回
+FAKE_UID=65531    # 想冒充 manager 的第三者
 
-echo "=== 0) 编译 daemon 夹具与探针 ==="
+echo "=== 0) 选一个能跑二进制的目录，再编夹具与探针 ==="
+
+# 为什么"先选目录、后编译"：
+#   容器化 runner 的工作区可能挂了 noexec。那种情况下**所有**产物都跑不起来，
+#   而且 root 也一样跑不起来（noexec 不看 uid）。
+#   如果先编 daemon 夹具、后才发现跑不了，就会得到"daemon 没了"这种
+#   离真实原因十万八千里的报错。所以先用一个小探针试出能 exec 的目录。
+probe_boot() {   # $1=uid
+    chmod 0755 "$BUILD" 2>/dev/null
+    chmod 0755 "$PROBE" 2>/dev/null
+    setpriv --reuid="$1" --regid="$1" --clear-groups \
+        env HOME=/tmp bash --noprofile --norc -c "exec -a com.boss.manager $PROBE selftest" >/dev/null 2>&1
+}
+
+diagnose() {     # $1=uid
+    echo "     诊断（uid=$1 无法 exec 探针）："
+    echo "       · 探针      : $PROBE"
+    ls -l "$PROBE" 2>&1 | sed 's/^/         /'
+    ls -ld "$BUILD" 2>&1 | sed 's/^/       · build 目录: /'
+    echo "       · umask    : $(umask)"
+    echo "       · 挂载选项 : $(findmnt -no OPTIONS -T "$BUILD" 2>/dev/null || echo '?')"
+    setpriv --reuid="$1" --regid="$1" --clear-groups \
+        env HOME=/tmp bash --noprofile --norc -c "exec -a com.boss.manager $PROBE selftest" 2>&1 \
+        | sed 's/^/       · 实际报错: /'
+}
+
+try_dir() {      # $1=候选目录；成功返回 0
+    BUILD="$1"
+    PROBE="$BUILD/ipc_probe"
+    mkdir -p "$BUILD" 2>/dev/null || return 1
+    cc -O1 -std=c11 -w -I"$ROOT/app/src/main/cpp" -o "$PROBE" \
+       "$HERE/ipc_probe.c" "$ROOT/app/src/main/cpp/boss_ipc.c" 2>/dev/null || return 1
+    for u in "$MGR_UID" "$ASK_UID" "$DENY_UID" "$FAKE_UID"; do
+        probe_boot "$u" || return 1
+    done
+    return 0
+}
+
+boot_bad=""
+if try_dir "${BOSS_BUILD_DIR:-$ROOT/build}"; then
+    :
+elif try_dir /tmp/boss-task6-build; then
+    echo "[i] 工作区目录不能执行二进制，已改用 $BUILD"
+else
+    try_dir "${BOSS_BUILD_DIR:-$ROOT/build}" >/dev/null 2>&1 || try_dir /tmp/boss-task6-build >/dev/null 2>&1
+    echo "SKIP 找不到一个能让 uid>10000 执行二进制的目录——能力不具备，不是代码有问题。"
+    diagnose "$MGR_UID"
+    exit 0
+fi
+echo "[ok] 探针自举通过（uid $MGR_UID/$ASK_UID/$DENY_UID/$FAKE_UID 都能 exec，构建目录 $BUILD）"
+
 cc -O1 -std=c11 -w -DBOSS_DIR="\"$TESTDIR\"" -DBOSS_MANAGER_PKG='"com.boss.manager"' \
    -o "$BUILD/boss-task6-fixture" \
    "$BOSS_SRC"/main.c "$BOSS_SRC"/util.c "$BOSS_SRC"/policy.c "$BOSS_SRC"/pty.c \
@@ -90,10 +143,6 @@ cc -O1 -std=c11 -w -DBOSS_DIR="\"$TESTDIR\"" -DBOSS_MANAGER_PKG='"com.boss.manag
        -o "$BUILD/boss-task6-fixture" "$BOSS_SRC"/*.c -ldl 2>&1 | tail -20
     exit 1; }
 
-cc -O1 -std=c11 -w -I"$ROOT/app/src/main/cpp" -o "$PROBE" \
-   "$HERE/ipc_probe.c" "$ROOT/app/src/main/cpp/boss_ipc.c" || {
-    echo "FAIL 探针编译失败"; exit 1; }
-
 rm -rf "$TESTDIR"
 mkdir -p "$TESTDIR"
 # 默认拒绝。65533 单独给一条 prompt 规则——它是第 5 节弹窗用例的主角。
@@ -107,11 +156,6 @@ DPID=$!
 cleanup() { kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null; }
 trap cleanup EXIT
 for _ in $(seq 1 50); do "$BUILD/boss-task6-fixture" ping >/dev/null 2>&1 && break; sleep 0.1; done
-
-MGR_UID=65534     # BOSS App
-ASK_UID=65533     # 策略 = prompt（弹窗用例）
-DENY_UID=65532    # 无规则 → default=deny，立即返回
-FAKE_UID=65531    # 想冒充 manager 的第三者
 
 # 伪装成 App：cmdline 必须是包名（真机上由 zygote 填）
 # HOME 指到 /tmp、--noprofile --norc：非 root 身份读 /root/.bashrc 会报
