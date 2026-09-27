@@ -13,7 +13,8 @@ SRCS := src/main.c src/util.c src/policy.c src/pty.c \
         src/daemon.c src/client.c src/bossinit.c \
         src/applet.c src/resetprop.c src/scripts.c src/module.c \
         src/sepolicy.c src/sh.c src/boot.c src/selinux.c src/sepol_backend.c \
-        src/mntinfo.c src/systemless.c src/hide.c
+        src/mntinfo.c src/systemless.c src/hide.c \
+        src/manager.c src/prompt.c
 OUT  := build/boss
 STATIC_OUT := build/boss-static
 # 内置 libsepol 用独立产物名：它是**另一个**二进制（多带一份 libsepol）。

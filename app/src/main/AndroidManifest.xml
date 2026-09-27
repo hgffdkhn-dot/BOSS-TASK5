@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      BOSS 不申请任何权限。
+      这不是疏忽，是设计：App 与 bossd 之间走的是 AF_UNIX 抽象命名空间，
+      文件系统里没有节点，也不需要 INTERNET / 存储权限。
+      每多一个权限就是多一份痕迹，而痕迹是这个产品最贵的东西。
+    -->
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_boss"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.BOSS"
+        android:enableOnBackInvokedCallback="true">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.BOSS">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

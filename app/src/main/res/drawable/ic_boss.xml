@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  用矢量图而不是 PNG：省掉 mipmap 的密度分发，也让图标只有一个文件。
+  取色走 ?attr/colorControlNormal，跟着系统的动态配色走——
+  一个写死颜色的图标在取了别种壁纸色的机器上会明显跳出来。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="?attr/colorControlNormal">
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M12,2 L4,6 V12 C4,17.5 7.4,21.7 12,23 C16.6,21.7 20,17.5 20,12 V6 L12,2 Z
+        M12,4.2 L18,7.1 V12 C18,16.2 15.4,19.7 12,21 C8.6,19.7 6,16.2 6,12 V7.1 L12,4.2 Z" />
+    <path
+        android:fillColor="@android:color/white"
+        android:pathData="M11,10 H9 V14 H11 V16 H13 V14 H15 V10 H13 V8 H11 V10 Z" />
+</vector>

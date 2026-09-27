@@ -1,0 +1,77 @@
+name: task6
+
+# 任务6 的三套自检。
+#
+# 与 ci.yml / components.yml / task5.yml 平级，都在同一个仓库里——
+# 这是全量包的直接好处：不需要 checkout 另一个仓库，也不需要先 apply 补丁，
+# 于是"以为补丁合进去了其实没有"这类事故在 CI 上不可能发生。
+#
+# runner 是**非 root**。这正好是要的身份：交接硬约束②说得很清楚，
+# 只跑 root 会得出完全错误的结论，以非 root 那份为准。
+# 所以这里不 sudo，也不为了让 CI 变绿去拆 needs_root。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ipc:
+    name: 协议布局 + IPC 端到端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译期协议布局断言
+        # 改了 src/boss.h 而 App 侧镜像（app/src/main/cpp/boss_ipc.h）没跟上，
+        # 红的就是这一步。别靠"放宽断言"让它绿——静默错位比报错贵得多。
+        run: bash tools/run_ipc_test.sh
+
+      - name: 非 root 身份再跑一遍（以这一份为准）
+        run: |
+          setpriv --reuid=65534 --regid=65534 --clear-groups \
+            bash tools/run_ipc_test.sh 2>&1 | tail -6
+
+  manager:
+    name: manager 身份 + 授权弹窗
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 端到端
+        run: bash tools/manager_flow_test.sh
+
+  contract:
+    name: CLI 输出契约（App 解析器的护栏）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 跑契约
+        run: bash tools/contract_test.sh
+
+  upstream:
+    name: 上游回归（确认任务6 没碰坏 2/3/4/5）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 编译 + 四套回归
+        run: |
+          make test
+          bash tools/smoke_test.sh
+          bash tools/systemless_test.sh
+          bash tools/hide_test.sh
+          bash tools/hijack_test.sh
+
+  android-native:
+    name: App 原生层编译
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 只编译协议层（不依赖 Android SDK，验语法与协议一致性）
+        # 完整 APK 需要 Android SDK，这里只保证 C 层是干净的：
+        # 协议客户端 + 布局断言 + 主机端到端，已经覆盖了它的全部逻辑。
+        run: |
+          mkdir -p build
+          cc -std=c11 -Wall -Wextra -Wno-unused-parameter \
+             -Isrc -Iapp/src/main/cpp \
+             -o build/ipc_layout_test tools/ipc_layout_test.c
+          ./build/ipc_layout_test

@@ -1,8 +1,18 @@
-# BOSS · su + 关键组件 + 任务5（任务 2 / 3 / 4 / 5）
+# BOSS · 全量包（任务 2 / 3 / 4 / 5 / 6）
+
+> **这是一个全量包**：BOSS-TASK5 的全部内容 + 任务6 的增量。
+> 前辈的文件一份都没删，只做增量添加与修改。两种用法：
+>   · 覆盖式推到 `BOSS-TASK5`（推荐，单一事实来源）
+>   · 或推到新仓 `BOSS-TASK6`（前辈存档原样保留）
+> 改 `PUSH-TO-GITHUB.sh` 里的 `REPO_NAME` 即可，或在命令行覆盖：
+> `REPO_NAME=BOSS-TASK6 bash PUSH-TO-GITHUB.sh`
+
+
 
 Magisk 式 root 管理器 BOSS 的 su 子系统与关键组件：主打**隐蔽、日用、实用**。
 镜像注入交给上游的 veritpath。
 
+- **任务6（客户端）的交付说明**：`docs/TASK6-BOSS客户端-解析与交付.md`
 - **任务6（客户端）接手先看**：`docs/HANDOFF-TASK6-客户端.md`（操作手册：
   三条硬约束、接口契约、别做错的事）
 - 任务5 的**交付说明**：`docs/TASK5-无修改系统逻辑与特典逻辑.md`（设计推演）
@@ -26,10 +36,15 @@ Magisk 式 root 管理器 BOSS 的 su 子系统与关键组件：主打**隐蔽�
 ## 目录
 
 ```
+app/        BOSS 客户端（Kotlin + 一个很小的 JNI 层）—— 任务6
+            src/main/cpp/  协议客户端 + JNI 胶水
+            src/main/java/ core（协议/CLI 契约）data（解析/仓库）ui（四个页面 + M3 Expressive）
 src/        boss.h / main.c / daemon.c / client.c / policy.c / pty.c / util.c / bossinit.c
+            manager.c（任务6：App 身份识别）/ prompt.c（任务6：授权弹窗）
             applet.c（分发）/ resetprop.c（属性改写）/ module.c（模块挂载）
             scripts.c（boot 脚本）/ boot.c（开机编排）/ sepolicy.c（策略工具）/ sh.c（工具集）
             mntinfo.c（挂载表解析）/ systemless.c（无修改系统逻辑）/ hide.c（特典）
+patches/    任务6 给 daemon 侧的补丁（已合入本包，留档备查）
 payload/    manifest.json + init.boss.rc（veritpath payload）
 build/      build-ndk.sh（NDK 交叉编译 + 组装 payload）
 tools/      smoke_test.sh（冒烟测试）、mkprop.py（造合成属性区）、elf_fix.py（修 PT_TLS 对齐）
@@ -46,6 +61,8 @@ docs/       方案解析与设计、HANDOFF 接力须知、TASK3 交付说明、
 - `components.yml`（2 个 job）：任务3 组件的**深度验收** + 属性区布局断言自检
 - `task5.yml`（2 个 job）：任务5 三套验收（systemless 16 / hide 17 / hijack 9）
   + 挂载解析"只有一份"的自检
+- `task6.yml`（5 个 job）：协议布局断言 / IPC 端到端 / manager+弹窗 / CLI 契约
+  + 上游回归（确认任务6 没碰坏 2/3/4/5）
 
 ```bash
 bash tools/smoke_test.sh        # 端到端主链路，28 项
@@ -53,6 +70,10 @@ bash tools/component_test.sh    # 任务3 边界与语义细节（root 与非 ro
 bash tools/systemless_test.sh   # 任务5 A 面：无修改系统逻辑
 bash tools/hide_test.sh         # 任务5 B 面：特典逻辑
 bash tools/hijack_test.sh       # 任务5 补完的 SwitchRoot 劫持布置
+
+bash tools/run_ipc_test.sh      # 任务6：协议布局断言 + IPC 端到端（两种身份）
+bash tools/manager_flow_test.sh # 任务6：manager 身份 + 授权弹窗（14 项）
+bash tools/contract_test.sh     # 任务6：CLI 输出契约（App 解析器的护栏，18 项）
 ```
 
 ```bash
@@ -99,6 +120,21 @@ veritpath verify out/init_boot.veritpath.img -p build/payload   # 非零退出�
 fastboot flash init_boot out/init_boot.veritpath.img
 ```
 
+## 任务6 · 客户端
+
+```bash
+./gradlew :app:assembleDebug
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
+
+- 主题是 **Material 3 Expressive**（Android 16 原生视觉语言）：动态取色 + 弹簧动效。
+  ⚠️ `material3` 必须锁死在 `1.5.0-alpha27`，**别让 Compose BOM 覆盖掉它**——
+  BOM 会把它拉回 1.4.0 稳定版，于是 Expressive 那几个 API 全部 unresolved，
+  而报错不会提示"版本被 BOM 换掉了"。
+- `applicationId` 必须与 daemon 侧的 `BOSS_MANAGER_PKG` 一致（`com.boss.manager`）。
+  包名对不上时 manager 判定永远失败，表现是"所有功能都显示被拒绝"且不报错。
+- App **不申请任何权限**。多一个权限就是多一份痕迹。
+
 ## 运行时布局
 
 ```
@@ -112,6 +148,9 @@ fastboot flash init_boot out/init_boot.veritpath.img
 /data/adb/boss/denylist.conf       任务5：隐藏名单
 /data/adb/boss/hide.state          任务5：已处理的 (pid, starttime)，防重复
 /data/adb/boss/props.conf          任务5：属性伪装清单
+/data/adb/boss/manager.uid         任务6：BOSS App 的 uid（daemon 侧认定）
+/data/adb/boss/prompt/<id>.req     任务6：待用户裁决的授权请求
+/data/adb/boss/prompt/<id>.ans     任务6：裁决结果（allow / deny）
 /data/adb/boss/post-fs-data.d/      阻塞阶段脚本
 /data/adb/boss/service.d/           late_start 脚本（绝大多数脚本的默认选择）
 /data/adb/boss/boot-completed.d/    开机完成后的脚本

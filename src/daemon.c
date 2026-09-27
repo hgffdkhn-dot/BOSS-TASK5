@@ -201,6 +201,74 @@ static void relay(int sock, int master)
     }
 }
 
+/* 任务6 · UI 控制通道：App 与 daemon 之间不跑命令的那条路
+ *
+ * 走的是同一个抽象套接字、同一套请求/响应帧，只是 BOSS_F_UI 标志让它
+ * 不 fork 子进程——req.command 在这里是控制指令，不是 shell 命令。
+ * 好处：不用新开一个 socket（少一个暴露面，也少一份连接管理代码）。
+ *
+ * 三条指令：
+ *   manager        我是谁（返回 manager uid，未注册返回 0）
+ *   pending        列出待用户裁决的授权请求（TSV，见 prompt.c）
+ *   allow/deny <id> 裁决某一条
+ *
+ * 全部要求 manager 身份。判定只用内核给的 uid + zygote 填的 cmdline。
+ */
+static void handle_ui(int sock, const struct boss_request *req, uid_t uid, pid_t pid)
+{
+    char caller[256] = { 0 };
+    boss_proc_cmdline(pid, caller, sizeof(caller));
+
+    /* 还没有人注册 manager 时，允许一次抢注（条件见 manager.c 顶部注释）。
+     * 已经注册过了就绝不顶掉——否则抢注窗口会从"刷机后一次"变成"每次开机"。 */
+    uid_t probe = 0;
+    if (boss_manager_load(&probe) != 0) {
+        if (boss_manager_register(uid, caller) == 0)
+            boss_log("manager 注册：uid=%u caller='%s'", (unsigned)uid, caller);
+    }
+
+    uid_t muid = 0;
+    if (boss_manager_load(&muid) != 0) muid = 0;
+    if (muid == 0 || (unsigned)muid != (unsigned)uid || !boss_manager_is(uid, caller)) {
+        respond(sock, BOSS_DENIED, 0);
+        return;
+    }
+
+    const char *op = req->command;
+
+    if (!strncmp(op, "pending", 7)) {
+        size_t cap = 8192;
+        char *buf = malloc(cap);
+        if (!buf) { respond(sock, BOSS_ERR, muid); return; }
+        prompt_pending(buf, cap);
+        respond(sock, BOSS_OK, muid);
+        /* 没有子进程，也就没有退出码通道：数据发完直接关连接，
+         * 客户端读到 EOF 就是结束。 */
+        (void)boss_write_full(sock, buf, strlen(buf));
+        free(buf);
+        return;
+    }
+
+    if (!strncmp(op, "allow ", 6) || !strncmp(op, "deny ", 5)) {
+        int allow = (op[0] == 'a');
+        const char *id = strchr(op, ' ');
+        if (!id) { respond(sock, BOSS_ERR, muid); return; }
+        while (*id == ' ' || *id == '\t') id++;
+        int rc = prompt_answer(id, allow);
+        boss_log("prompt %s -> %s（manager uid=%u）", id, allow ? "allow" : "deny",
+                 (unsigned)uid);
+        respond(sock, rc == 0 ? BOSS_OK : BOSS_ERR, muid);
+        return;
+    }
+
+    if (!strncmp(op, "manager", 7)) {
+        respond(sock, BOSS_OK, muid);
+        return;
+    }
+
+    respond(sock, BOSS_ERR, muid);
+}
+
 static void handle_client(int sock)
 {
     uid_t uid = (uid_t)-1;
@@ -229,6 +297,13 @@ static void handle_client(int sock)
 
     if (req.magic != BOSS_MAGIC || req.version != BOSS_PROTO_VER) {
         respond(sock, BOSS_ERR, 0);
+        goto done;
+    }
+
+    /* 任务6：UI 控制通道。必须在 fork 之前拦下来，
+     * 否则 "pending" 会被当成一条 shell 命令跑一遍。 */
+    if (req.flags & BOSS_F_UI) {
+        handle_ui(sock, &req, uid, pid);
         goto done;
     }
 
@@ -274,6 +349,42 @@ static void handle_client(int sock)
     }
 
     if (req.flags & BOSS_F_PING) { respond(sock, BOSS_OK, req.target_uid); policy_free(&pol); goto done; }
+
+    /* 任务6：BOSS App（manager）自动放行。
+     * 为什么不直接写一条 policy 规则：App 连 /data/adb/boss 都进不去（0700 root），
+     * 没法给自己写规则——鸡生蛋只能由 daemon 解开。判定用内核给的 uid。 */
+    if (decision != BOSS_DECISION_ALLOW && boss_manager_is(uid, caller)) {
+        decision = BOSS_DECISION_ALLOW;
+        if (!(req.flags & BOSS_F_NOLOG))
+            boss_log("manager uid=%u 自动放行", (unsigned)uid);
+    }
+
+    /* 任务6：prompt 真的等用户裁决。
+     * 三元语义不变（allow / deny / prompt），变的是 prompt 不再"按拒绝处理"。
+     * 等不到答复（超时 / 客户端先走了）一律往拒绝走——弹窗这条路上，
+     * 宁可让用户重按一次，也不能默认放行。 */
+    if (decision == BOSS_DECISION_PROMPT) {
+        char idbuf[128] = { 0 };
+        if (prompt_create(uid, caller, req.command, idbuf, sizeof(idbuf)) == 0) {
+            boss_log("prompt id=%s uid=%u 等待用户裁决", idbuf, (unsigned)uid);
+            int ans = 0;
+            int prc = prompt_wait(idbuf, sock, 0, &ans);
+            prompt_remove(idbuf);
+            if (prc != 0 || !ans) {
+                respond(sock, BOSS_DENIED, req.target_uid);
+                policy_free(&pol);
+                goto done;
+            }
+            decision = BOSS_DECISION_ALLOW;
+            boss_log("prompt id=%s -> allow（本次有效；长期放行请写 policy.conf）", idbuf);
+        } else {
+            /* 建不了请求记录就别弹了，直接拒绝：
+             * 一个弹不出来的弹窗等于把用户永久挂起。 */
+            respond(sock, BOSS_DENIED, req.target_uid);
+            policy_free(&pol);
+            goto done;
+        }
+    }
 
     if (decision != BOSS_DECISION_ALLOW) {
         respond(sock, decision == BOSS_DECISION_PROMPT ? BOSS_PROMPT : BOSS_DENIED, req.target_uid);

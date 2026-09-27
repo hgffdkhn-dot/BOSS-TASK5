@@ -1,0 +1,578 @@
+--- a/src/boss.h
++++ b/src/boss.h
+@@ -17,7 +17,7 @@
+ #define _GNU_SOURCE 1
+ 
+ #define BOSS_MAGIC      0xB0550001u   /* "BOSS" v1 */
+-#define BOSS_PROTO_VER  1u
++#define BOSS_PROTO_VER  2u
+ #define BOSS_VERSION    "0.1.0"
+ 
+ /* ---- 运行时路径（编译期可覆盖，便于主机侧冒烟测试） ---- */
+@@ -44,6 +44,8 @@
+ #define BOSS_SYLESS_CONF   BOSS_DIR "/systemless.conf"  /* 声明式"系统改动"清单 */
+ #define BOSS_SYLESS_BASE   BOSS_DIR "/systemless.baseline" /* 只读分区基线快照（verify 用） */
+ #define BOSS_DENY_CONF     BOSS_DIR "/denylist.conf"    /* 隐藏名单（特典） */
++#define BOSS_MANAGER_FILE  BOSS_DIR "/manager.uid"      /* 任务6：BOSS App 的 uid */
++#define BOSS_PROMPT_DIR    BOSS_DIR "/prompt"           /* 任务6：待用户裁决的授权请求 */
+ #define BOSS_DENY_STATE    BOSS_DIR "/hide.state"       /* 已处理的 (pid,starttime)，防重复 umount */
+ #define BOSS_PROPS_CONF    BOSS_DIR "/props.conf"       /* 属性伪装清单（特典） */
+ 
+@@ -87,6 +89,10 @@
+ #define BOSS_F_KEEPENV  (1u << 1)   /* 保留调用方环境变量 */
+ #define BOSS_F_NOLOG    (1u << 2)   /* 本次请求不记日志 */
+ #define BOSS_F_PING     (1u << 3)   /* 只探活，不执行命令 */
++/* 任务6：UI 控制通道。不 fork 子进程，command 字段是控制指令而不是 shell 命令。
++ * 老 daemon 不认这个标志会把指令当命令跑一遍——所以协议版本同时升到了 2，
++ * 不让它静默发生（"扩展语义必须升 PROTO_VER"是任务2 交接时的原话）。 */
++#define BOSS_F_UI       (1u << 4)   /* App 控制通道：pending / allow <id> / deny <id> */
+ 
+ struct boss_request {
+     uint32_t magic;
+@@ -208,6 +214,24 @@
+ int  boss_sh_main(int argc, char **argv);          /* A2 standalone shell */
+ int  boss_applet_main(int argc, char **argv);      /* A1 applet symlink 管理 */
+ 
++/* ---- 任务6：manager 身份识别（src/manager.c）----
++ * 默认策略是 deny，而 App 连 /data/adb/boss 都进不去，没法自己写规则。
++ * 所以 manager 的放行由 daemon 侧认定，判定只用内核给的 uid。 */
++int  boss_manager_load(uid_t *uid);
++int  boss_manager_set(uid_t uid);          /* uid=0 表示清除 */
++int  boss_manager_register(uid_t uid, const char *caller);
++int  boss_manager_is(uid_t uid, const char *caller);
++const char *boss_manager_pkg(void);
++
++/* ---- 任务6：授权弹窗（src/prompt.c）----
++ * fork-per-client 的 daemon 里，等待者与答复者是两个进程，
++ * 用 BOSS_DIR 下的 .req / .ans 文件配对（详见 prompt.c 顶部注释）。 */
++int  prompt_create(uid_t uid, const char *caller, const char *cmd, char *id, size_t idsz);
++void prompt_remove(const char *id);
++int  prompt_answer(const char *id, int allow);
++int  prompt_wait(const char *id, int sock, int timeout_ms, int *decision);
++int  prompt_pending(char *out, size_t cap);
++
+ /* ---- 任务5 入口 ---- */
+ int  boss_systemless_main(int argc, char **argv);  /* 无修改系统逻辑：清单应用 + 零写入自检 */
+ int  boss_hide_main(int argc, char **argv);        /* 特典：隐藏名单 / 挂载痕迹治理 / 属性伪装 */
+--- a/src/daemon.c
++++ b/src/daemon.c
+@@ -201,6 +201,74 @@
+     }
+ }
+ 
++/* 任务6 · UI 控制通道：App 与 daemon 之间不跑命令的那条路
++ *
++ * 走的是同一个抽象套接字、同一套请求/响应帧，只是 BOSS_F_UI 标志让它
++ * 不 fork 子进程——req.command 在这里是控制指令，不是 shell 命令。
++ * 好处：不用新开一个 socket（少一个暴露面，也少一份连接管理代码）。
++ *
++ * 三条指令：
++ *   manager        我是谁（返回 manager uid，未注册返回 0）
++ *   pending        列出待用户裁决的授权请求（TSV，见 prompt.c）
++ *   allow/deny <id> 裁决某一条
++ *
++ * 全部要求 manager 身份。判定只用内核给的 uid + zygote 填的 cmdline。
++ */
++static void handle_ui(int sock, const struct boss_request *req, uid_t uid, pid_t pid)
++{
++    char caller[256] = { 0 };
++    boss_proc_cmdline(pid, caller, sizeof(caller));
++
++    /* 还没有人注册 manager 时，允许一次抢注（条件见 manager.c 顶部注释）。
++     * 已经注册过了就绝不顶掉——否则抢注窗口会从"刷机后一次"变成"每次开机"。 */
++    uid_t probe = 0;
++    if (boss_manager_load(&probe) != 0) {
++        if (boss_manager_register(uid, caller) == 0)
++            boss_log("manager 注册：uid=%u caller='%s'", (unsigned)uid, caller);
++    }
++
++    uid_t muid = 0;
++    if (boss_manager_load(&muid) != 0) muid = 0;
++    if (muid == 0 || (unsigned)muid != (unsigned)uid || !boss_manager_is(uid, caller)) {
++        respond(sock, BOSS_DENIED, 0);
++        return;
++    }
++
++    const char *op = req->command;
++
++    if (!strncmp(op, "pending", 7)) {
++        size_t cap = 8192;
++        char *buf = malloc(cap);
++        if (!buf) { respond(sock, BOSS_ERR, muid); return; }
++        prompt_pending(buf, cap);
++        respond(sock, BOSS_OK, muid);
++        /* 没有子进程，也就没有退出码通道：数据发完直接关连接，
++         * 客户端读到 EOF 就是结束。 */
++        (void)boss_write_full(sock, buf, strlen(buf));
++        free(buf);
++        return;
++    }
++
++    if (!strncmp(op, "allow ", 6) || !strncmp(op, "deny ", 5)) {
++        int allow = (op[0] == 'a');
++        const char *id = strchr(op, ' ');
++        if (!id) { respond(sock, BOSS_ERR, muid); return; }
++        while (*id == ' ' || *id == '\t') id++;
++        int rc = prompt_answer(id, allow);
++        boss_log("prompt %s -> %s（manager uid=%u）", id, allow ? "allow" : "deny",
++                 (unsigned)uid);
++        respond(sock, rc == 0 ? BOSS_OK : BOSS_ERR, muid);
++        return;
++    }
++
++    if (!strncmp(op, "manager", 7)) {
++        respond(sock, BOSS_OK, muid);
++        return;
++    }
++
++    respond(sock, BOSS_ERR, muid);
++}
++
+ static void handle_client(int sock)
+ {
+     uid_t uid = (uid_t)-1;
+@@ -232,6 +300,13 @@
+         goto done;
+     }
+ 
++    /* 任务6：UI 控制通道。必须在 fork 之前拦下来，
++     * 否则 "pending" 会被当成一条 shell 命令跑一遍。 */
++    if (req.flags & BOSS_F_UI) {
++        handle_ui(sock, &req, uid, pid);
++        goto done;
++    }
++
+     if (req.env_len && req.env_len <= BOSS_MAX_BLOB) {
+         env_blob = malloc(req.env_len);
+         if (env_blob && boss_read_full(sock, env_blob, req.env_len) < 0) {
+@@ -275,6 +350,42 @@
+ 
+     if (req.flags & BOSS_F_PING) { respond(sock, BOSS_OK, req.target_uid); policy_free(&pol); goto done; }
+ 
++    /* 任务6：BOSS App（manager）自动放行。
++     * 为什么不直接写一条 policy 规则：App 连 /data/adb/boss 都进不去（0700 root），
++     * 没法给自己写规则——鸡生蛋只能由 daemon 解开。判定用内核给的 uid。 */
++    if (decision != BOSS_DECISION_ALLOW && boss_manager_is(uid, caller)) {
++        decision = BOSS_DECISION_ALLOW;
++        if (!(req.flags & BOSS_F_NOLOG))
++            boss_log("manager uid=%u 自动放行", (unsigned)uid);
++    }
++
++    /* 任务6：prompt 真的等用户裁决。
++     * 三元语义不变（allow / deny / prompt），变的是 prompt 不再"按拒绝处理"。
++     * 等不到答复（超时 / 客户端先走了）一律往拒绝走——弹窗这条路上，
++     * 宁可让用户重按一次，也不能默认放行。 */
++    if (decision == BOSS_DECISION_PROMPT) {
++        char idbuf[128] = { 0 };
++        if (prompt_create(uid, caller, req.command, idbuf, sizeof(idbuf)) == 0) {
++            boss_log("prompt id=%s uid=%u 等待用户裁决", idbuf, (unsigned)uid);
++            int ans = 0;
++            int prc = prompt_wait(idbuf, sock, 0, &ans);
++            prompt_remove(idbuf);
++            if (prc != 0 || !ans) {
++                respond(sock, BOSS_DENIED, req.target_uid);
++                policy_free(&pol);
++                goto done;
++            }
++            decision = BOSS_DECISION_ALLOW;
++            boss_log("prompt id=%s -> allow（本次有效；长期放行请写 policy.conf）", idbuf);
++        } else {
++            /* 建不了请求记录就别弹了，直接拒绝：
++             * 一个弹不出来的弹窗等于把用户永久挂起。 */
++            respond(sock, BOSS_DENIED, req.target_uid);
++            policy_free(&pol);
++            goto done;
++        }
++    }
++
+     if (decision != BOSS_DECISION_ALLOW) {
+         respond(sock, decision == BOSS_DECISION_PROMPT ? BOSS_PROMPT : BOSS_DENIED, req.target_uid);
+         policy_free(&pol);
+--- a/src/policy.c
++++ b/src/policy.c
+@@ -157,16 +157,37 @@
+                 "  set default <deny|allow>\n"
+                 "  set log <0|1>\n"
+                 "  add  <uid|app|user> <id> <allow|deny|prompt>\n"
+-                "  del  <uid|app|user> <id>\n");
++                "  del  <uid|app|user> <id>\n"
++                "  manager [uid]       查询/钉死 BOSS App 的 uid（0 = 清除）\n");
+         return 2;
+     }
+ 
++    /* 任务6：manager uid 的查询与钉死。
++     * 抢注窗口（刷机后首次开机）是已知残留风险，这条命令是它的手动退路：
++     *   boss policy manager          # 看当前 manager uid
++     *   boss policy manager 10123    # 钉死
++     *   boss policy manager 0        # 清除，等下次抢注 */
++    if (!strcmp(argv[1], "manager")) {
++        if (argc == 2) {
++            uid_t u = 0;
++            if (boss_manager_load(&u) == 0) printf("manager : %u\n", (unsigned)u);
++            else printf("manager : (未注册)\n");
++            return 0;
++        }
++        unsigned long v = strtoul(argv[2], NULL, 10);
++        return boss_manager_set((uid_t)v) == 0 ? 0 : 1;
++    }
++
+     if (!strcmp(argv[1], "show")) {
+         struct boss_policy p;
+         if (policy_load(&p, path) < 0) { fprintf(stderr, "no policy file\n"); return 1; }
+         printf("path    : %s\n", path);
+         printf("default : %s\n", decision_name(p.default_decision));
+         printf("log     : %d\n", p.log_enabled);
++        {
++            uid_t mu = 0;
++            printf("manager : %s\n", boss_manager_load(&mu) == 0 ? "已注册" : "(未注册)");
++        }
+         for (int i = 0; i < p.nrules; i++) {
+             const char *kind = p.rules[i].type == 0 ? "uid" : (p.rules[i].type == 1 ? "app" : "user");
+             printf("rule    : %s %d %s\n", kind, p.rules[i].id, decision_name(p.rules[i].decision));
+--- a/Makefile
++++ b/Makefile
+@@ -13,7 +13,8 @@
+         src/daemon.c src/client.c src/bossinit.c \
+         src/applet.c src/resetprop.c src/scripts.c src/module.c \
+         src/sepolicy.c src/sh.c src/boot.c src/selinux.c src/sepol_backend.c \
+-        src/mntinfo.c src/systemless.c src/hide.c
++        src/mntinfo.c src/systemless.c src/hide.c \
++        src/manager.c src/prompt.c
+ OUT  := build/boss
+ STATIC_OUT := build/boss-static
+ # 内置 libsepol 用独立产物名：它是**另一个**二进制（多带一份 libsepol）。
+diff --git a/src/manager.c b/src/manager.c
+new file mode 100644
+--- /dev/null
++++ b/src/manager.c
+@@ -0,0 +1,123 @@
++/* 任务6 · BOSS 客户端（manager）身份识别
++ *
++ * 为什么需要这个文件：
++ *   默认策略是 deny（policy.c 的 kDefaultPolicy）。BOSS App 本身是个普通
++ *   app，它的 uid 不可能预先写进 policy.conf——它连 /data/adb/boss 都进不去
++ *   （0700 root）。于是出现鸡生蛋问题：**App 必须先被放行，才能写下放行自己
++ *   的规则**。这就是任务6 接手时"BOSS 前端授权"那一格空着的真正原因。
++ *
++ * 解法：daemon 认一个"manager uid"并持久化。
++ *   判定用**内核给的 uid**（SO_PEERCRED），cmdline 只做辅助校验——
++ *   架构红线第 2 条：身份只信内核。cmdline 是 app 进程由 zygote 填的，
++ *   我们拿它当第二道锁，不是为了替代 uid。
++ *
++ * 残留风险（诚实写出来，别当不存在）：
++ *   manager.uid 还没落盘时，任何 **app uid**（>=10000）且 cmdline 等于
++ *   BOSS_MANAGER_PKG 的进程都能抢注。窗口是"刷机后第一次开机到 App 首次
++ *   联网/启动"之间。真机上想收紧，用 root shell 预先写死：
++ *       echo 10123 > /data/adb/boss/manager.uid
++ *   或者 `boss policy manager <uid>`。
++ */
++#define _GNU_SOURCE 1
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "boss.h"
++
++#ifndef BOSS_MANAGER_PKG
++#define BOSS_MANAGER_PKG "com.boss.manager"
++#endif
++
++#define BOSS_MANAGER_FILE BOSS_DIR "/manager.uid"
++
++/* Android 的 app uid 从 10000 起。低于它的都是系统身份，绝不能当 manager。 */
++#define BOSS_APP_UID_MIN 10000u
++
++/* zygote 给 app 进程填的 cmdline 是包名，但后面可能带参数/空格。
++ * 只比前缀，且要求后面要么是 NUL 要么是分隔符——否则
++ * "com.boss.manager.evil" 会被当成 "com.boss.manager"。 */
++static int caller_is_pkg(const char *caller, const char *pkg)
++{
++    if (!caller || !pkg || !*caller) return 0;
++    size_t n = strlen(pkg);
++    if (strncmp(caller, pkg, n) != 0) return 0;
++    char c = caller[n];
++    return (c == '\0' || c == ' ' || c == '\t' || c == ':');
++}
++
++int boss_manager_load(uid_t *uid)
++{
++    if (!uid) return -1;
++    FILE *fp = fopen(BOSS_MANAGER_FILE, "re");
++    if (!fp) return -1;
++    char line[64];
++    int ok = 0;
++    /* 逐行找第一个不是注释的行。
++     * 踩过的坑：文件头写了 "# BOSS manager uid" 这种注释行，解析时
++     * strtoul 遇到 '#' 直接返回 0 且 end==line，于是"已注册但读出来是 0"，
++     * 表现为 manager 注册成功了、下一次却被判成未注册。
++     * 注释是给人看的，解析器必须跳过它——和 policy.conf 一个道理。 */
++    while (fgets(line, sizeof(line), fp)) {
++        char *s2 = line;
++        while (*s2 == ' ' || *s2 == '\t') s2++;
++        if (*s2 == '#' || *s2 == '\n' || *s2 == '\0') continue;
++        char *end = NULL;
++        unsigned long v = strtoul(s2, &end, 10);
++        if (end && end != s2 && v >= BOSS_APP_UID_MIN) {
++            *uid = (uid_t)v;
++            ok = 1;
++        }
++        break;
++    }
++    fclose(fp);
++    return ok ? 0 : -1;
++}
++
++/* 写入/清除 manager uid。uid=0 表示清除（重置，等下次抢注）。 */
++int boss_manager_set(uid_t uid)
++{
++    if (uid == 0) {
++        unlink(BOSS_MANAGER_FILE);
++        return 0;
++    }
++    if (boss_mkdirs(BOSS_DIR, 0700) < 0) return -1;
++    FILE *fp = fopen(BOSS_MANAGER_FILE, "we");
++    if (!fp) return -1;
++    fprintf(fp, "# BOSS manager uid（" BOSS_MANAGER_PKG "）\n%u\n", (unsigned)uid);
++    fclose(fp);
++    chmod(BOSS_MANAGER_FILE, 0644);
++    return 0;
++}
++
++/* 首次注册。返回 0 = 注册成功，1 = 已有人注册（本次不认），-1 = 不合格。
++ * 不管失败原因是什么都不改已有记录——已注册的 manager 不能被顶掉，
++ * 否则抢注窗口就从"刷机后一次"变成"每次开机"。 */
++int boss_manager_register(uid_t uid, const char *caller)
++{
++    uid_t cur = 0;
++    if (boss_manager_load(&cur) == 0) return 1;
++    if (uid < BOSS_APP_UID_MIN) return -1;
++    if (!caller_is_pkg(caller, BOSS_MANAGER_PKG)) return -1;
++    return boss_manager_set(uid) == 0 ? 0 : -1;
++}
++
++/* 这次调用是不是 manager 本人。uid 必须是内核给的那个。 */
++int boss_manager_is(uid_t uid, const char *caller)
++{
++    uid_t cur = 0;
++    if (boss_manager_load(&cur) != 0) return 0;
++    if ((unsigned)cur != (unsigned)uid) return 0;
++    /* cmdline 是辅助校验：uid 对了但包名不对，说明 App 被重装到别的包、
++     * 或 uid 被复用给了别的应用——这种情况不放行。 */
++    if (caller && !caller_is_pkg(caller, BOSS_MANAGER_PKG)) return 0;
++    return 1;
++}
++
++const char *boss_manager_pkg(void)
++{
++    return BOSS_MANAGER_PKG;
++}
+diff --git a/src/prompt.c b/src/prompt.c
+new file mode 100644
+--- /dev/null
++++ b/src/prompt.c
+@@ -0,0 +1,202 @@
++/* 任务6 · 授权弹窗（prompt）的真实实现
++ *
++ * 任务2 把三元语义（allow / deny / prompt）留了下来，但 prompt 一直"按拒绝
++ * 处理"——BOSS_PROMPT 只是个返回码，没人等用户。任务6 要把它补成真的：
++ * 用户点一下，命令才继续跑。
++ *
++ * 为什么用**文件**而不是共享内存 / 新 socket：
++ *   daemon 是 fork-per-client 的（见 boss_daemon_main）。等待中的 handler 与
++ *   答复它的 UI handler 是两个互不相干的进程，共享内存要额外建映射，新 socket
++ *   要新的一套连接管理。而 BOSS_DIR 本来就是 root 私有的 0700 目录，
++ *   一个 .req + 一个 .ans 文件就够了，代价是轮询（200ms 一轮，只在弹窗期间）。
++ *
++ * 两个必须做对的细节：
++ *   1. **等待期间要同时看着客户端 socket。** 用户没点、app 先退了，请求就该
++ *      作废，否则 handler 会白等到超时，还留一个孤儿 .req 文件。
++ *   2. **id 必须校验。** id 来自 App（不可信输入），会拼进路径。只接受
++ *      [A-Za-z0-9_.-]，否则 "a/../../etc/x" 这类能写到任意位置。
++ */
++#define _GNU_SOURCE 1
++#include <dirent.h>
++#include <errno.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "boss.h"
++
++#define BOSS_PROMPT_DIR BOSS_DIR "/prompt"
++#define PROMPT_POLL_MS  200
++#define PROMPT_TIMEOUT_MS 60000   /* 一分钟没人点就当拒绝，别把开机卡住 */
++
++static int id_ok(const char *id)
++{
++    if (!id || !*id || strlen(id) > 96) return 0;
++    for (const char *p = id; *p; p++) {
++        char c = *p;
++        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++            (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-')
++            continue;
++        return 0;   /* 含 '/'、空格、'..' 之外的怪字符一律拒绝 */
++    }
++    return 1;
++}
++
++static void path_of(char *out, size_t n, const char *id, const char *ext)
++{
++    snprintf(out, n, "%s/%s.%s", BOSS_PROMPT_DIR, id, ext);
++}
++
++int prompt_create(uid_t uid, const char *caller, const char *cmd,
++                  char *id, size_t idsz)
++{
++    if (!id || idsz < 32) return -1;
++    if (boss_mkdirs(BOSS_PROMPT_DIR, 0700) < 0) return -1;
++
++    snprintf(id, idsz, "%u_%lld_%d", (unsigned)uid,
++             (long long)time(NULL), (int)getpid());
++
++    char p[512];
++    path_of(p, sizeof(p), id, "req");
++    FILE *fp = fopen(p, "we");
++    if (!fp) return -1;
++    fprintf(fp, "uid=%u\ncaller=%s\ncmd=%s\nts=%lld\n",
++            (unsigned)uid, caller ? caller : "?", cmd ? cmd : "",
++            (long long)time(NULL));
++    fclose(fp);
++    chmod(p, 0600);
++    return 0;
++}
++
++void prompt_remove(const char *id)
++{
++    if (!id_ok(id)) return;
++    char p[512];
++    path_of(p, sizeof(p), id, "req");
++    unlink(p);
++    path_of(p, sizeof(p), id, "ans");
++    unlink(p);
++}
++
++/* App 答复。allow=1 放行，0 拒绝。 */
++int prompt_answer(const char *id, int allow)
++{
++    if (!id_ok(id)) return -1;
++    char rp[512];
++    path_of(rp, sizeof(rp), id, "req");
++    FILE *f = fopen(rp, "re");
++    if (!f) return -1;      /* 请求已经不在了（超时/客户端走了） */
++    fclose(f);
++
++    char ap[512];
++    path_of(ap, sizeof(ap), id, "ans");
++    FILE *fp = fopen(ap, "we");
++    if (!fp) return -1;
++    fputs(allow ? "allow\n" : "deny\n", fp);
++    fclose(fp);
++    return 0;
++}
++
++/* 等待答复。
++ * 返回  0 = 拿到答复（*decision 为 1 放行 / 0 拒绝）
++ *       1 = 超时（按拒绝处理）
++ *      -1 = 客户端已经消失（按拒绝处理）
++ * 出错也一律往"拒绝"走：弹窗这条路上，宁可让用户重按一次，也不能默认放行。 */
++int prompt_wait(const char *id, int sock, int timeout_ms, int *decision)
++{
++    if (!decision) return -1;
++    *decision = 0;
++    if (!id_ok(id)) return -1;
++
++    int wait_ms = timeout_ms > 0 ? timeout_ms : PROMPT_TIMEOUT_MS;
++    int elapsed = 0;
++    char ap[512];
++    path_of(ap, sizeof(ap), id, "ans");
++
++    while (elapsed < wait_ms) {
++        FILE *fp = fopen(ap, "re");
++        if (fp) {
++            char line[32] = { 0 };
++            if (fgets(line, sizeof(line), fp)) *decision = (strncmp(line, "allow", 5) == 0);
++            fclose(fp);
++            return 0;
++        }
++
++        /* 同时看着客户端：它走了就别等了 */
++        if (sock >= 0) {
++            struct pollfd pfd;
++            pfd.fd = sock;
++            pfd.events = POLLIN;
++            pfd.revents = 0;
++            int r = poll(&pfd, 1, PROMPT_POLL_MS);
++            if (r > 0 && (pfd.revents & (POLLHUP | POLLERR))) return -1;
++            if (r > 0 && (pfd.revents & POLLIN)) {
++                /* 客户端在等答复时不该发数据；发了说明它已经不对劲了 */
++                char tmp[64];
++                ssize_t n = read(sock, tmp, sizeof(tmp));
++                if (n <= 0) return -1;
++            }
++        } else {
++            usleep(PROMPT_POLL_MS * 1000);
++        }
++        elapsed += PROMPT_POLL_MS;
++    }
++    return 1;
++}
++
++/* 列出待决请求，给 App 轮询用。
++ * 输出格式（一行一条，App 按行切）：
++ *   <id>\t<uid>\t<caller>\t<cmd>
++ * 为什么是 TSV 而不是 JSON：这一层没有 JSON 解析器（boss 只有 libc），
++ * 而 cmd 里可能有空格，用空格分隔必然解析错。制表符同样可能出现在 cmd 里，
++ * 所以 cmd 放最后、整行剩下的都算 cmd。 */
++int prompt_pending(char *out, size_t cap)
++{
++    if (!out || cap == 0) return -1;
++    out[0] = '\0';
++    size_t off = 0;
++
++    DIR *d = opendir(BOSS_PROMPT_DIR);
++    if (!d) return 0;       /* 没有待决请求不是错误 */
++
++    struct dirent *e;
++    while ((e = readdir(d))) {
++        const char *name = e->d_name;
++        size_t nl = strlen(name);
++        if (nl < 5 || strcmp(name + nl - 4, ".req") != 0) continue;
++
++        char id[128];
++        snprintf(id, sizeof(id), "%s", name);
++        id[nl - 4] = '\0';
++        if (!id_ok(id)) continue;
++
++        char p[512];
++        path_of(p, sizeof(p), id, "req");
++        FILE *fp = fopen(p, "re");
++        if (!fp) continue;
++
++        char line[256];
++        char uid[32] = "?", caller[128] = "?", cmd[256] = "";
++        char ts[64] = "";
++        while (fgets(line, sizeof(line), fp)) {
++            char *nlp = strchr(line, '\n');
++            if (nlp) *nlp = '\0';
++            if (!strncmp(line, "uid=", 4))         snprintf(uid, sizeof(uid), "%.31s", line + 4);
++            else if (!strncmp(line, "caller=", 7)) snprintf(caller, sizeof(caller), "%.127s", line + 7);
++            else if (!strncmp(line, "cmd=", 4))    snprintf(cmd, sizeof(cmd), "%.255s", line + 4);
++            else if (!strncmp(line, "ts=", 3))     snprintf(ts, sizeof(ts), "%.63s", line + 3);
++        }
++        fclose(fp);
++
++        int n = snprintf(out + off, cap - off, "%s\t%s\t%s\t%s\t%s\n",
++                         id, uid, caller, cmd, ts);
++        if (n < 0 || (size_t)n >= cap - off) break;
++        off += (size_t)n;
++    }
++    closedir(d);
++    return (int)off;
++}

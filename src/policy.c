@@ -157,8 +157,25 @@ int boss_policy_main(int argc, char **argv)
                 "  set default <deny|allow>\n"
                 "  set log <0|1>\n"
                 "  add  <uid|app|user> <id> <allow|deny|prompt>\n"
-                "  del  <uid|app|user> <id>\n");
+                "  del  <uid|app|user> <id>\n"
+                "  manager [uid]       查询/钉死 BOSS App 的 uid（0 = 清除）\n");
         return 2;
+    }
+
+    /* 任务6：manager uid 的查询与钉死。
+     * 抢注窗口（刷机后首次开机）是已知残留风险，这条命令是它的手动退路：
+     *   boss policy manager          # 看当前 manager uid
+     *   boss policy manager 10123    # 钉死
+     *   boss policy manager 0        # 清除，等下次抢注 */
+    if (!strcmp(argv[1], "manager")) {
+        if (argc == 2) {
+            uid_t u = 0;
+            if (boss_manager_load(&u) == 0) printf("manager : %u\n", (unsigned)u);
+            else printf("manager : (未注册)\n");
+            return 0;
+        }
+        unsigned long v = strtoul(argv[2], NULL, 10);
+        return boss_manager_set((uid_t)v) == 0 ? 0 : 1;
     }
 
     if (!strcmp(argv[1], "show")) {
@@ -167,6 +184,10 @@ int boss_policy_main(int argc, char **argv)
         printf("path    : %s\n", path);
         printf("default : %s\n", decision_name(p.default_decision));
         printf("log     : %d\n", p.log_enabled);
+        {
+            uid_t mu = 0;
+            printf("manager : %s\n", boss_manager_load(&mu) == 0 ? "已注册" : "(未注册)");
+        }
         for (int i = 0; i < p.nrules; i++) {
             const char *kind = p.rules[i].type == 0 ? "uid" : (p.rules[i].type == 1 ? "app" : "user");
             printf("rule    : %s %d %s\n", kind, p.rules[i].id, decision_name(p.rules[i].decision));

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  窗口主题只负责 Activity 出现之前那一瞬间的背景。
+  真正的配色在 ui/theme/Theme.kt 里由 Compose 决定（动态取色 + Material 3 Expressive）。
+
+  NoActionBar 是必须的：有 ActionBar 的话 Compose 的内容会被它压掉一块，
+  而且和 edge-to-edge 冲突，表现为顶部一条颜色对不上的横条。
+-->
+<resources>
+    <style name="Theme.BOSS" parent="android:Theme.Material.NoActionBar" />
+</resources>

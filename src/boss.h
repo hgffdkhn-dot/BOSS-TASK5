@@ -17,7 +17,7 @@
 #define _GNU_SOURCE 1
 
 #define BOSS_MAGIC      0xB0550001u   /* "BOSS" v1 */
-#define BOSS_PROTO_VER  1u
+#define BOSS_PROTO_VER  2u
 #define BOSS_VERSION    "0.1.0"
 
 /* ---- 运行时路径（编译期可覆盖，便于主机侧冒烟测试） ---- */
@@ -44,6 +44,8 @@
 #define BOSS_SYLESS_CONF   BOSS_DIR "/systemless.conf"  /* 声明式"系统改动"清单 */
 #define BOSS_SYLESS_BASE   BOSS_DIR "/systemless.baseline" /* 只读分区基线快照（verify 用） */
 #define BOSS_DENY_CONF     BOSS_DIR "/denylist.conf"    /* 隐藏名单（特典） */
+#define BOSS_MANAGER_FILE  BOSS_DIR "/manager.uid"      /* 任务6：BOSS App 的 uid */
+#define BOSS_PROMPT_DIR    BOSS_DIR "/prompt"           /* 任务6：待用户裁决的授权请求 */
 #define BOSS_DENY_STATE    BOSS_DIR "/hide.state"       /* 已处理的 (pid,starttime)，防重复 umount */
 #define BOSS_PROPS_CONF    BOSS_DIR "/props.conf"       /* 属性伪装清单（特典） */
 
@@ -87,6 +89,10 @@ enum {
 #define BOSS_F_KEEPENV  (1u << 1)   /* 保留调用方环境变量 */
 #define BOSS_F_NOLOG    (1u << 2)   /* 本次请求不记日志 */
 #define BOSS_F_PING     (1u << 3)   /* 只探活，不执行命令 */
+/* 任务6：UI 控制通道。不 fork 子进程，command 字段是控制指令而不是 shell 命令。
+ * 老 daemon 不认这个标志会把指令当命令跑一遍——所以协议版本同时升到了 2，
+ * 不让它静默发生（"扩展语义必须升 PROTO_VER"是任务2 交接时的原话）。 */
+#define BOSS_F_UI       (1u << 4)   /* App 控制通道：pending / allow <id> / deny <id> */
 
 struct boss_request {
     uint32_t magic;
@@ -207,6 +213,24 @@ int  boss_script_main(int argc, char **argv);      /* B3 boot 阶段脚本执行
 int  boss_module_main(int argc, char **argv);      /* B2 模块 / overlay 挂载 + D1 */
 int  boss_sh_main(int argc, char **argv);          /* A2 standalone shell */
 int  boss_applet_main(int argc, char **argv);      /* A1 applet symlink 管理 */
+
+/* ---- 任务6：manager 身份识别（src/manager.c）----
+ * 默认策略是 deny，而 App 连 /data/adb/boss 都进不去，没法自己写规则。
+ * 所以 manager 的放行由 daemon 侧认定，判定只用内核给的 uid。 */
+int  boss_manager_load(uid_t *uid);
+int  boss_manager_set(uid_t uid);          /* uid=0 表示清除 */
+int  boss_manager_register(uid_t uid, const char *caller);
+int  boss_manager_is(uid_t uid, const char *caller);
+const char *boss_manager_pkg(void);
+
+/* ---- 任务6：授权弹窗（src/prompt.c）----
+ * fork-per-client 的 daemon 里，等待者与答复者是两个进程，
+ * 用 BOSS_DIR 下的 .req / .ans 文件配对（详见 prompt.c 顶部注释）。 */
+int  prompt_create(uid_t uid, const char *caller, const char *cmd, char *id, size_t idsz);
+void prompt_remove(const char *id);
+int  prompt_answer(const char *id, int allow);
+int  prompt_wait(const char *id, int sock, int timeout_ms, int *decision);
+int  prompt_pending(char *out, size_t cap);
 
 /* ---- 任务5 入口 ---- */
 int  boss_systemless_main(int argc, char **argv);  /* 无修改系统逻辑：清单应用 + 零写入自检 */
