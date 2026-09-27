@@ -204,6 +204,50 @@ Compose BOM 2026.08.00 把 ui/foundation 锁到 1.12.0
 targetSdk 管"采不采用新运行时行为"。Android 16 的 edge-to-edge 与预测式返回
 在 36 上已经是强制的，够用了；推到 37 会引入一批**我们一行都没验过**的行为变更。
 
+### 又一个坑：`sdkmanager` 装不到 android-37
+
+CI 上真跑出来的第二条：
+
+```
+yes: standard output: Broken pipe
+Warning: Failed to find package 'platforms;android-37'
+Error: Process completed with exit code 1
+```
+
+**两个信息要分开看：**
+
+- `Broken pipe` 是**噪声**，不是错误。它来自 `yes | sdkmanager --licenses`——
+  sdkmanager 提前退出了，`yes` 还在往关闭的管道里写。用 `yes 2>/dev/null` 收掉即可。
+- `Failed to find package 'platforms;android-37'` 是**真问题**：
+  这个 runner 的 sdkmanager 渠道里**没有 android-37 这个包**。
+
+⚠️ 关键判断：**这不代表 API 37 不存在，只代表这个渠道没发到它。**
+所以不能据此断定"必须降级"——得让编译器自己说话。
+
+CI 上的处理分两步：
+
+1. **安装步骤改成"尽力而为，不阻断"**（`continue-on-error: true`）。
+   允许它失败，把已装的东西打出来，交给编译阶段给结论。
+   装不上就在这里挂掉，等于真正的编译一次都没跑，白等。
+2. **构建步骤带回退**：先试 37；失败且确认平台确实不存在时，
+   把 `compileSdk` 临时改成 36 再试一次。
+
+⚠️ **预期 36 也会失败**——Compose 1.12.0 的 AAR 硬校验同样要求 compileSdk ≥ 37。
+这么做的目的不是让 36 成功，而是**用两次失败把原因分开**：
+- 37 报"找不到平台"、36 报"AAR 元数据" → 平台缺失
+- 两条都报"AAR 元数据" → 版本链不对（AGP/Gradle/BOM）
+
+对着一条报错猜，是这类问题最大的时间黑洞。
+
+### 如果确认这个渠道就是拿不到 android-37
+
+两条路，按推荐顺序：
+
+1. **换 runner 镜像或 Android Studio 版本。** 官方对应关系是
+   API 37 ↔ AGP 9.1.1 ↔ Gradle 9.3.1 ↔ **Android Studio Panda 3（2025.3.3 Patch 1）**。
+   老镜像的 sdkmanager 渠道里不会有它。
+2. **走退路降级**（见下节），但那要付出丢掉 Expressive 的代价。
+
 ### 本地要做的两件事（CI 已经写好了，本地得自己做）
 
 ```bash
