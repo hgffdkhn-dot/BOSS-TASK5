@@ -62,6 +62,22 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: 清掉残留的旧图标文件（先清，再检查）
+        # 这个文件为什么需要 CI 自己动手删：
+        #   ic_boss.xml 已经从 Manifest 的引用链上摘掉了，
+        #   但**只要文件还在，aapt 就会编译它**——资源链接照样失败。
+        #   而它在任何引用关系里都看不见，所以：
+        #     · 本地删了、没 git add -A 提交删除 → 推上去别人拉的还是有
+        #     · 手工排查永远发现不了它（Manifest 看着完全正常）
+        #   已经连续三轮卡在这儿了，所以不再依赖人工，交给 CI 自己清。
+        #   这是**幂等**的：文件不存在就什么都不做。
+        run: |
+          for f in app/src/main/res/drawable/ic_boss.xml \
+                   app/src/main/res/drawable/ic_launcher.xml; do
+            if [ -f "$f" ]; then rm -f "$f"; echo "已删除 $f"; fi
+          done
+          echo "当前 drawable/：$(ls app/src/main/res/drawable/ 2>/dev/null | tr '\n' ' ')"
+
       - name: 工具链自检（复用 tools/check_android_toolchain.sh）
         # 为什么不在这里内联写一遍：
         #   之前内联了一版，只查 AGP/compileSdk。后来又陆续踩到

@@ -21,3 +21,9 @@ app/build/
 .externalNativeBuild/
 local.properties
 *.iml
+
+# --- 已废弃的旧图标（最后一道兜底）---
+# ic_boss.xml 已从 Manifest 摘掉，但只要文件还在就会被 aapt 编译，
+# 资源链接照样失败。CI 会主动删它，这里忽略它是为了防止
+# 又从某个旧工作区被 add 回来。
+app/src/main/res/drawable/ic_boss.xml

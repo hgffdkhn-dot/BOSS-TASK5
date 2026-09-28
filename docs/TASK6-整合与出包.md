@@ -486,6 +486,47 @@ bash tools/check_android_toolchain.sh --fix
 这类"本地绿的、CI 红的"九成是旧文件没删掉或没提交删除。
 `git rm` 之后重新推，别指望"再跑一次"会变好。
 
+### 残留旧图标：连卡三轮之后，改成 CI 自己清
+
+同一个报错连续出现三轮：
+
+```
+失败项：
+    - app/src/main/res/drawable/ic_boss.xml:8  用了 ?attr/colorControlNormal，但未声明
+    - 残留旧图标文件： drawable/ic_boss.xml
+```
+
+本地两份包都是干净的、自检 PASS——所以是**推上去的仓库里还有这个文件**。
+但既然三轮都卡在这儿，说明"让人去删"这条路不可靠，改成三层**自动**处理：
+
+**① CI 里先删再检查**（主要手段）
+
+```yaml
+- name: 清掉残留的旧图标文件（先清，再检查）
+  run: |
+    for f in app/src/main/res/drawable/ic_boss.xml ...; do
+      [ -f "$f" ] && { rm -f "$f"; echo "已删除 $f"; }
+    done
+```
+
+幂等：文件不存在就什么都不做。
+
+**② `.gitignore` 里忽略它**（防回流）
+
+```
+app/src/main/res/drawable/ic_boss.xml
+```
+
+防止它又从某个旧工作区被 `git add` 回来。
+
+**③ `tools/check_android_toolchain.sh --fix`**（本地自愈，可选）
+
+> 为什么非得自动：这类文件**不在任何引用链上**——
+> Manifest 已经改成 `@mipmap/ic_launcher`、看引用关系一切正常，
+> 但 aapt 照样编译它，资源链接照样失败。
+> 而"本地删了没 `git add -A` 提交删除"又是最容易犯的一步，
+> 结果就是"本地绿的、CI 红的"。靠人记住不可靠，交给机器。
+
 ### android-37 只有次要版本，必须写 `compileSdkMinor`
 
 CI 上终于装上了 android-37，但自检报：
