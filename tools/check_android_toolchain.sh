@@ -74,6 +74,42 @@ echo "  targetSdk  = ${ts:-未读到}"
                  || warn "targetSdk=$ts（期望 36；37 会引入未验的运行时行为变更）"
 
 echo
+echo "== 3.5) AGP 9 的内置 Kotlin（这次就是栽在这）=="
+# AGP 9.0 起 Kotlin 编译内置进 AGP，再声明 org.jetbrains.kotlin.android 会直接冲突：
+#   InvalidPluginException: applying plugin request [id: 'org.jetbrains.kotlin.android', ...]
+#   → The 'org.jetbrains.kotlin.android' plugin is no longer required since AGP 9.0
+# 报错只说"应用插件时异常"，不提"不该声明"，只看第一行会往"版本不对"上想。
+if [ -n "$agp" ] && ver_ge "$agp" "9.0.0"; then
+    echo "  AGP $agp ≥ 9 → 内置 Kotlin 生效，kotlin.android 必须不存在"
+    hit=0
+    for f in build.gradle.kts app/build.gradle.kts gradle/libs.versions.toml; do
+        [ -f "$ROOT/$f" ] || continue
+        # 只看生效行：文件里有大段注释在解释"为什么没有它"，直接 grep 会误报
+        if grep -E '^[^#/*]*org\.jetbrains\.kotlin\.android' "$ROOT/$f" >/dev/null 2>&1; then
+            bad "$f 里仍声明了 org.jetbrains.kotlin.android —— AGP 9 下必然冲突，删掉"
+            hit=1
+        fi
+    done
+    [ "$hit" = "0" ] && ok "三处构建脚本里都没有 kotlin.android"
+
+    grep -q 'org.jetbrains.kotlin.plugin.compose' "$ROOT/gradle/libs.versions.toml" \
+        && ok "Compose 编译器插件在（Kotlin 版本只喂给它）" \
+        || bad "缺 org.jetbrains.kotlin.plugin.compose —— @Composable 编不了"
+
+    if grep -q 'kotlin-gradle-plugin:' "$ROOT/build.gradle.kts" 2>/dev/null; then
+        kgp=$(grep -oE 'kotlin-gradle-plugin:[0-9]+\.[0-9]+\.[0-9]+' "$ROOT/build.gradle.kts" | head -1 | cut -d: -f2)
+        echo "  根脚本 KGP = ${kgp:-未读到}"
+        [ "$kgp" = "$kotlin" ] \
+            && ok "根脚本 KGP($kgp) == 版本目录 kotlin($kotlin)（两处必须同号）" \
+            || bad "根脚本 KGP($kgp) ≠ 版本目录 kotlin($kotlin)。buildscript 里读不到版本目录，得手写同一份"
+    else
+        warn "根脚本没有 buildscript 拉 KGP —— Kotlin 会被钉在 AGP 内置的 2.2.10"
+    fi
+else
+    echo "  skip  AGP $agp < 9，不适用内置 Kotlin"
+fi
+
+echo
 echo "== 4) gradle.properties =="
 # 只匹配**生效的**那一行：文件里有一大段注释在解释"为什么别写它"，
 # 直接 grep 关键字会命中注释，于是永远报 warn——假警报比没警报更烦人。

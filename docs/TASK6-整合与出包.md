@@ -204,6 +204,54 @@ Compose BOM 2026.08.00 把 ui/foundation 锁到 1.12.0
 targetSdk 管"采不采用新运行时行为"。Android 16 的 edge-to-edge 与预测式返回
 在 36 上已经是强制的，够用了；推到 37 会引入一批**我们一行都没验过**的行为变更。
 
+### 第三个坑：AGP 9 内置了 Kotlin，`kotlin.android` 不能再声明
+
+```
+InvalidPluginException: An exception occurred applying plugin request
+    [id: 'org.jetbrains.kotlin.android', version: '2.3.0']
+→ The 'org.jetbrains.kotlin.android' plugin is no longer required
+  for Kotlin support since AGP 9.0.
+```
+
+**AGP 9.0 起 Kotlin 编译内置进 AGP**，官方迁移步骤第一步就是把
+`org.jetbrains.kotlin.android` 从**三处**删掉：版本目录、根脚本、模块脚本。
+
+这个报错的坑在于措辞：它说"应用插件时异常"，**完全不提"这个插件不该出现"**。
+只看第一行会往"2.3.0 版本不对"上想，然后去降 Kotlin——方向错了。
+
+改完之后的三处形态：
+
+| 位置 | 内容 |
+|---|---|
+| `gradle/libs.versions.toml` | `[plugins]` 里**只有** `kotlin-compose`（Compose 编译器），没有 `kotlin-android` |
+| 根 `build.gradle.kts` | `buildscript` 里显式拉 `kotlin-gradle-plugin:2.3.0` |
+| `app/build.gradle.kts` | 只留 `kotlin.compose`；编译器选项搬到顶层 `kotlin { compilerOptions {} }` |
+
+两个连带要点：
+
+1. **`kotlin` 这个版本号现在只喂给 Compose 编译器插件**——Compose 编译器随 Kotlin 一起发布，
+   两者版本号必须一致。真正的 Kotlin 编译器版本靠根脚本 `buildscript` 里的
+   `classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")` 指定——
+   因为 **buildscript 块里读不到版本目录**，那串数字得手写，改版本时两处都要改。
+   （自检脚本会比对这两处是否同号。）
+2. **`android { kotlinOptions {} }` 是旧写法**，AGP 9 内置 Kotlin 下要搬到顶层
+   `kotlin { compilerOptions { jvmTarget / optIn } }`。
+   `optIn` 那一项不能省：Expressive 的 API 还在 alpha，不开全局 opt-in
+   就得每个文件手写 `@OptIn`，漏一个就编译失败。
+
+⚠️ **别用 `android.builtInKotlin=false` 绕。** 那是兼容退路（关掉内置 Kotlin、回到手动声明
+kotlin.android），官方说会在 AGP 10 移除。开了等于把刚迁好的东西退回旧模型，
+而且会让刚删掉的插件重新变成"必须"——自相矛盾。
+
+自检脚本加了 3.5 节专门查这一组：
+
+```
+== 3.5) AGP 9 的内置 Kotlin ==
+  ok   三处构建脚本里都没有 kotlin.android
+  ok   Compose 编译器插件在（Kotlin 版本只喂给它）
+  ok   根脚本 KGP(2.3.0) == 版本目录 kotlin(2.3.0)（两处必须同号）
+```
+
 ### 又一个坑：`sdkmanager` 装不到 android-37
 
 CI 上真跑出来的第二条：
@@ -239,14 +287,68 @@ CI 上的处理分两步：
 
 对着一条报错猜，是这类问题最大的时间黑洞。
 
-### 如果确认这个渠道就是拿不到 android-37
+### 决策：**选方案 1——换镜像/换工具，保住 API 37 与 Expressive**
 
-两条路，按推荐顺序：
+（方案 2 是降级到 compileSdk 36 + material3 1.4.0，会丢掉整个 Material 3 Expressive。
+已决定不走那条。）
 
-1. **换 runner 镜像或 Android Studio 版本。** 官方对应关系是
-   API 37 ↔ AGP 9.1.1 ↔ Gradle 9.3.1 ↔ **Android Studio Panda 3（2025.3.3 Patch 1）**。
-   老镜像的 sdkmanager 渠道里不会有它。
-2. **走退路降级**（见下节），但那要付出丢掉 Expressive 的代价。
+落地做了三件事，按重要性排：
+
+**① 下载官方 latest 通道的 cmdline-tools——这是真正解决问题的一步**
+
+```yaml
+curl -sSLO https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
+unzip -q commandlinetools-linux-*_latest.zip
+mv cmdline-tools "$SDK/cmdline-tools/latest"    # 路径必须是这个布局
+```
+
+> ⚠️ 很多人以为"换镜像"指的是换 OS 版本——**不是**。
+> android-37 能不能装到，取决于 **sdkmanager（cmdline-tools）的版本与渠道**，
+> 跟 Ubuntu 是 22.04 还是 24.04 无关。镜像里预装的 sdkmanager 版本太旧，
+> 渠道里就没有这个包。换成 latest 通道的那一份才有机会看到它。
+>
+> 另外 sdkmanager 必须在 `$SDK/cmdline-tools/latest/bin/` 这个布局下，
+> 直接解压出来用会报 `Could not determine SDK root`。
+
+**② runner 镜像钉死为 `ubuntu-24.04`，不用 `ubuntu-latest`**
+
+跟 android-37 无关，是为了**确定性**：`ubuntu-latest` 会随时间漂移，
+自带的 SDK 版本跟着变，某天突然红都不知道为什么。钉死后，
+升级镜像是一次**有意的提交**，不是意外。
+
+**③ 加 `android.builder.sdkDownload=true` 兜底**
+
+让 AGP 缺平台时自己去补，而不是直接报
+"Failed to find target with hash string 'android-37'"。多一层机会，不影响本地。
+
+### 顺带把"猜"改成"看"
+
+新增一个**探测步骤**，在装之前先把渠道里有什么列出来：
+
+```
+=== 可用 platforms（grep 35 以上）===
+    platforms;android-36 | 1 | Android SDK Platform 36
+    platforms;android-37 | 1 | Android SDK Platform 37
+```
+
+"装不到"和"渠道里根本没有"长得一模一样，只有 `--list` 能把它们分开。
+先看清再决定，比装失败后猜快得多。
+
+### 万一 latest 通道也拿不到 android-37
+
+构建步骤会明确列出两条路并停掉，**不会**默默改成 36 假装能过：
+
+- **A. 换更新的 runner 镜像**（改 apk job 的 `runs-on`）。
+  官方对应：API 37 ↔ AGP 9.1.1 ↔ Gradle 9.3.1
+  ↔ Android Studio Panda 3（2025.3.3 Patch 1）。
+- **B. 走降级**（方案 2）：AGP 8.13.2 + Gradle 8.13 + compileSdk 36
+  + Compose BOM 2026.06 + material3 1.4.0 —— 代价是丢掉整个 Expressive。
+
+⚠️ 如果真走到 B，要改的不只是版本号：`ui/theme/Theme.kt` 得从
+`MaterialExpressiveTheme` 退回普通 `MaterialTheme`，`ui/MainActivity.kt` 里的
+`LoadingIndicator` 得换成 `LinearProgressIndicator`，`kotlinOptions` 那套
+（AGP 9 已迁到顶层 `kotlin { compilerOptions {} }`）也要跟着回退。
+**别只改版本号就以为完事了。**
 
 ### 本地要做的两件事（CI 已经写好了，本地得自己做）
 

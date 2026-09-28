@@ -48,7 +48,12 @@ jobs:
 
   apk:
     name: BOSS App（客户端 APK）
-    runs-on: ubuntu-latest
+    # ⚠️ runner 镜像**钉死**，不用 ubuntu-latest。
+    #    ubuntu-latest 会随时间漂移（今天 24.04，明天可能 26.04），
+    #    而它自带的 Android SDK / cmdline-tools 版本跟着变。
+    #    这次的 android-37 装不上，本质就是镜像里的 sdkmanager 渠道太旧。
+    #    钉死后环境是确定的；要升级镜像时是**有意改的一次提交**，不是某天突然红。
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -93,6 +98,40 @@ jobs:
           ver_ge "$GRADLE_VER" "9.3.1" || {
             echo "ERROR: Gradle $GRADLE_VER < 9.3.1，AGP 9.1.1 的硬下限。"; exit 1; }
 
+      - name: 取最新 cmdline-tools（不依赖镜像预装的 sdkmanager）
+        # 为什么不用镜像里那个：
+        #   上一次就是它报 "Failed to find package 'platforms;android-37'"——
+        #   预装的 sdkmanager 版本太旧，渠道里根本没有这个包。
+        #   换成官方 latest 通道的 cmdline-tools，才有机会看到 android-37。
+        #
+        # 布局要求：sdkmanager 必须落在 $SDK/cmdline-tools/latest/bin/ 下，
+        #   直接解压出去用会报 "Could not determine SDK root"。
+        run: |
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+          echo "SDK = $SDK"
+          cd /tmp
+          curl -sSLO "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
+          rm -rf cmdline-tools
+          unzip -q commandlinetools-linux-*_latest.zip
+          mkdir -p "$SDK/cmdline-tools"
+          rm -rf "$SDK/cmdline-tools/latest"
+          mv cmdline-tools "$SDK/cmdline-tools/latest"
+          echo "$SM 版本：" ; "$SDK/cmdline-tools/latest/bin/sdkmanager" --version
+
+      - name: 探测 android-37 在不在渠道里（先看清，再决定）
+        # 关键判断：**列出来看**，而不是直接装、失败就猜。
+        #   装不到的时候，"渠道里没有"和"网络失败/参数错"长得一模一样，
+        #   只有 --list 能把这两种分开。
+        run: |
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          echo "=== 可用 platforms（grep 35 以上）==="
+          "$SM" --list 2>/dev/null | grep -E '^ *platforms;android-(3[5-9]|[4-9][0-9])' | sed 's/^/    /' \
+            || echo "    （没列出来——可能是网络问题，也可能是渠道里真没有）"
+          echo
+          echo "=== 已装 ==="
+          "$SM" --list_installed 2>/dev/null | grep -E 'platforms;|build-tools;' | sed 's/^/    /' || true
+
       - name: 装 SDK 平台 37 与 Build Tools 36.0.0（尽力而为，不阻断）
         # 需要的两样：compileSdk 37 → android-37 平台；AGP 9.1.1 → build-tools 36.0.0。
         #
@@ -111,12 +150,13 @@ jobs:
         continue-on-error: true
         run: |
           SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
-          echo "SDK = $SDK"
-          SM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
-          SM=${SM:-$(command -v sdkmanager)}
-          if [ -z "$SM" ]; then
-            echo "[warn] 找不到 sdkmanager——跳过安装，交给编译阶段判断"
+          # 用刚装上的 latest 那一份，不再用镜像预装的旧 sdkmanager
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then
+            echo "[warn] 找不到 $SM——跳过安装，交给编译阶段判断"
           else
+            # 许可证要先接受，否则 --install 会卡在交互提示上。
+            # `yes | ...` 会产生 Broken pipe（sdkmanager 提前退出）——那是噪声，收掉。
             yes 2>/dev/null | "$SM" --licenses >/dev/null 2>&1 || true
             "$SM" --install "platforms;android-37" "build-tools;36.0.0" 2>&1 \
               | grep -vE 'Broken pipe' || true
@@ -167,18 +207,31 @@ jobs:
           if gradle :app:assembleDebug --no-daemon --stacktrace; then
             echo "[ok] compileSdk 37 构建成功"
           else
-            echo "[i] 37 失败。先看是不是平台根本没装上："
+            echo
+            echo "[i] 37 构建失败。先分清是'平台没装上'还是'版本链不对'："
             if ! ls -d "$SDK"/platforms/android-37* >/dev/null 2>&1; then
-              echo "    → android-37 平台不存在。改用 compileSdk 36 重试一次，"
-              echo "      用两次结果来区分'平台缺失'与'版本链不对'。"
+              echo "    → android-37 平台**确实没装到**（上一部的探测输出里也没有它）。"
+              echo
+              echo "    这时只剩两条路，没有第三条："
+              echo "      A. 换更新的 runner 镜像（改本 job 的 runs-on）——"
+              echo "         官方对应：API 37 ↔ AGP 9.1.1 ↔ Gradle 9.3.1"
+              echo "                  ↔ Android Studio Panda 3（2025.3.3 Patch 1）"
+              echo "      B. 走降级：AGP 8.13.2 + Gradle 8.13 + compileSdk 36"
+              echo "         + Compose BOM 2026.06 + material3 1.4.0（丢掉 Expressive）"
+              echo
+              echo "    下面是**诊断性**重试：临时改成 36 再编一次。"
+              echo "    ⚠️ 预期也会失败——Compose 1.12.0 的 AAR 同样要求 compileSdk ≥ 37。"
+              echo "    目的不是让 36 成功，而是用两次结果确认'罪魁祸首是平台缺失'。"
               sed -i 's/^ *compileSdk = 37/    compileSdk = 36/' app/build.gradle.kts
-              grep -n 'compileSdk' app/build.gradle.kts | grep -v '^ *[0-9]*: *\*'
               gradle :app:assembleDebug --no-daemon --stacktrace || {
-                echo "36 也失败 —— 说明不是平台问题，是版本链（AGP/Gradle/Compose BOM）的问题。"
-                echo "对照 docs/TASK6-整合与出包.md 4.5 节检查四个版本。"
+                echo
+                echo "    36 也失败（符合预期）→ 确认是平台缺失，不是版本链。"
+                echo "    请在上一步的探测输出里确认渠道里到底有没有 android-37，"
+                echo "    然后选 A 或 B。详见 docs/TASK6-整合与出包.md 4.5 节。"
                 exit 1; }
             else
-              echo "    → 平台在，那就是版本链的问题（不是平台缺失）。直接失败。"
+              echo "    → 平台**在**，那就是版本链的问题（AGP/Gradle/BOM/Compose 之一）。"
+              echo "      对照 docs/TASK6-整合与出包.md 4.5 节检查那四个版本。"
               exit 1
             fi
           fi

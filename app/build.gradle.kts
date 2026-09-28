@@ -7,13 +7,15 @@
 //   2. minSdk 26 对齐 payload/manifest.json 的 min_api。
 plugins {
     alias(libs.plugins.android.application)
-    /* AGP 9.x 起 Kotlin 编译被内置进 AGP，官方说法是"不用手动加 kotlin.android"。
-     * 这里仍然显式声明，是为了让版本目录里的 kotlin = 2.3.0 生效
-     * （AGP 内置的 KGP 是 2.2.10，低于我们指定的会自动升上来）。
-     *
-     * ⚠️ 如果 sync 时报 Kotlin 插件版本冲突，第一件事是把下面这行注释掉，
-     *    让它完全交给 AGP 内置的那一份——而不是去降 Kotlin 版本。 */
-    alias(libs.plugins.kotlin.android)
+    /* ⚠️ 这里**不能**有 kotlin.android。
+     * AGP 9.0 起 Kotlin 编译内置在 AGP 里，再声明 org.jetbrains.kotlin.android
+     * 会直接冲突：
+     *   InvalidPluginException: ... applying plugin request
+     *   [id: 'org.jetbrains.kotlin.android', version: '2.3.0']
+     *   → The 'org.jetbrains.kotlin.android' plugin is no longer required
+     *     for Kotlin support since AGP 9.0.
+     * 报错只说"应用插件时异常"，不提"不该声明"——只看第一行会往版本上想，
+     * 实际是插件本身要删掉。Kotlin 版本改在根 build.gradle.kts 的 buildscript 里。 */
     alias(libs.plugins.kotlin.compose)
 }
 
@@ -80,17 +82,25 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-        // Expressive 的 API 还在 alpha，opt-in 警告会刷屏。
-        // 全局开关放在这里，而不是每个文件各写一遍 @OptIn。
-        freeCompilerArgs += listOf(
-            "-opt-in=androidx.compose.material3.ExperimentalMaterial3ExpressiveApi",
-        )
-    }
+
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+}
+
+/* 顶层 kotlin{} 而不是 android{ kotlinOptions{} }：
+ *   AGP 9 的内置 Kotlin 下，编译器选项搬到顶层 kotlin.compilerOptions{}。
+ *   android.kotlinOptions{} 是旧写法（官方迁移文档明确要求改）。
+ *
+ * jvmTarget 默认跟随 compileOptions.targetCompatibility，这里显式写 17 只为清楚。
+ *
+ * opt-in 这一项不能省：Material 3 Expressive 的 API 还在 alpha，
+ * 不开全局 opt-in 的话每个用到它的文件都得手写 @OptIn，漏一个就编译失败。 */
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        optIn.add("androidx.compose.material3.ExperimentalMaterial3ExpressiveApi")
     }
 }
 

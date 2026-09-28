@@ -61,5 +61,14 @@ compose-material-icons-extended = { module = "androidx.compose.material:material
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+# ⚠️ 这里**故意没有** kotlin-android。
+#    AGP 9.0 起 Kotlin 编译内置，再声明 org.jetbrains.kotlin.android 会冲突：
+#      "The 'org.jetbrains.kotlin.android' plugin is no longer required
+#       for Kotlin support since AGP 9.0."
+#    官方迁移步骤第一步就是把它从版本目录、根脚本、模块脚本里全删掉。
+#
+#    kotlin 这个版本号现在**只喂给 Compose 编译器插件**——
+#    Compose 编译器随 Kotlin 发布，两者版本必须一致。
+#    真正的 Kotlin 编译器版本在根 build.gradle.kts 的 buildscript 里
+#    （那里读不到版本目录，得手写同一份数字）。
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
