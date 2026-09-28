@@ -4,14 +4,14 @@
 
   ⚠️ 这个文件**绝对不能**用 ?attr/ 取色。原因有两条，第二条更要命：
 
-  1. 构建期：`?attr/colorControlNormal` 是 **AppCompat** 定义的属性。
+  1. 构建期：`?attr/` + AppCompat 定义的颜色属性（名字就不写了，免得被扫描脚本当成真引用）
      BOSS 是纯 Compose 项目，不依赖 appcompat，所以它在我们自己的包名下
      根本不存在 —— 报 "找不到资源 attr/colorControlNormal"。
      加 `android:` 前缀（?android:attr/...）能编过，但见第 2 条。
 
   2. 运行期（真原因）：**launcher 图标是在 launcher 进程里加载的，
      用的是 launcher 的 theme，不是我们的。**
-     任何 ?attr/ 在那里解析的结果都不由我们决定，
+     任何主题属性引用在那里解析的结果都不由我们决定，
      同一份图标在不同 launcher 上颜色会不一样，甚至解析失败。
      所以 launcher 图标必须写死颜色，没有例外。
 

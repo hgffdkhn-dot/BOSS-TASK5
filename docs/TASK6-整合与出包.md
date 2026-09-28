@@ -378,6 +378,46 @@ mv cmdline-tools "$SDK/cmdline-tools/latest"    # 路径必须是这个布局
 "装不到"和"渠道里根本没有"长得一模一样，只有 `--list` 能把它们分开。
 先看清再决定，比装失败后猜快得多。
 
+### 自检脚本自己报了假警报（FAIL=1，但代码是好的）
+
+CI 上自检输出：
+
+```
+FAIL  ?attr/colorControlNormal 未声明
+ok    android:icon 指向 @mipmap（自适应图标）
+```
+
+但仓库里**根本没有**这个引用——它在 `ic_launcher_foreground.xml` 的
+**注释**里，是我拿它当反面例子写的。
+
+成因：扫描前要用 `perl` 剥掉 XML 注释，而 **runner 上没有 perl**，
+`strip_comments` 退化成了 `cat`，于是把注释扫了进去。
+
+> ⚠️ 这是同一个坑的**第二次**：上一次是 `gradle.properties` 那条——
+> 注释里解释了"为什么别写 suppressUnsupportedCompileSdk"，
+> 直接 grep 就命中注释，永远 warn。
+> **教训：写检查脚本时，你自己的注释也是输入的一部分。**
+
+两层修法，缺一不可：
+
+1. **注释里不再出现可被匹配的字面量**。改成 `?attr/` + "AppCompat 定义的颜色属性"
+   （名字不写出来），这样任何扫描都匹配不到。
+2. **剥注释不依赖单一工具**：`python3`（runner 一定有）→ `perl` →
+   **两者都没有就跳过这项检查并说明**。
+
+第 2 条的收尾原则值得单独说一句：
+
+> **剥不掉就别下结论**。宁可少查一项，也不要报一个假 FAIL。
+> 假 FAIL 的代价远大于漏查——它会让人去改本来正确的代码。
+
+已实测三个分支：
+
+| 场景 | 结果 |
+|---|---|
+| 无 python3 也无 perl | `warn` 跳过，不误报 |
+| 正常环境 | PASS |
+| 故意塞一个真引用 | 抓出 FAIL 并进汇总 |
+
 ### android-37 只有次要版本，必须写 `compileSdkMinor`
 
 CI 上终于装上了 android-37，但自检报：

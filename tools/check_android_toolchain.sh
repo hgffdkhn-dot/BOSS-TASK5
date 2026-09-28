@@ -129,15 +129,37 @@ else
     #   不剥掉的话这条检查会永远报 FAIL——假警报比没警报更烦人。
     #   （上一版 gradle.properties 那条也栽过同样的坑。）
     strip_comments() {
-        if command -v perl >/dev/null 2>&1; then
+        # ⚠️ 这里**不能**退化成 cat。
+        #   注释里常常写着反面例子（比如"?attr/ 是 AppCompat 的属性"），
+        #   退化成 cat 就会把注释当成真引用，永远误报 FAIL——
+        #   这次在 CI 上就吃了一次：runner 里没有 perl，于是假警报。
+        #   （同类坑已经在 gradle.properties 那条上栽过一次。）
+        #
+        #   优先级：python3（runner 一定有）→ perl → **跳过检查并说明**。
+        #   剥不掉就别下结论，宁可少查一项，也不要报一个假 FAIL。
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c '
+import re,sys
+try:
+    sys.stdout.write(re.sub(r"<!--.*?-->", "", open(sys.argv[1], encoding="utf-8", errors="replace").read(), flags=re.S))
+except Exception:
+    sys.stdout.write("")
+' "$1" 2>/dev/null
+        elif command -v perl >/dev/null 2>&1; then
             perl -0777 -pe 's/<!--.*?-->//gs' "$1" 2>/dev/null
         else
-            cat "$1"
+            return 1   # 剥不掉：交给调用方跳过
         fi
     }
-    hits=$(find "$res_dir" -type f -name '*.xml' 2>/dev/null \
-           | while read -r f; do strip_comments "$f"; done \
-           | grep -ohE '\?attr/[A-Za-z_][A-Za-z0-9_]*' | sort -u)
+    if command -v python3 >/dev/null 2>&1 || command -v perl >/dev/null 2>&1; then
+        hits=$(find "$res_dir" -type f -name '*.xml' 2>/dev/null \
+               | while read -r f; do strip_comments "$f" || true; done \
+               | grep -ohE '\?attr/[A-Za-z_][A-Za-z0-9_]*' | sort -u)
+    else
+        hits=""
+        warn "没有 python3 也没有 perl，剥不掉 XML 注释——跳过这项检查"
+        echo "      （宁可少查一项，也不报假 FAIL：注释里的反面例子会被当成真引用）"
+    fi
     if [ -z "$hits" ]; then
         ok "res/ 里没有 ?attr/ 引用"
     else
