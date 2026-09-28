@@ -139,6 +139,7 @@ dependencies {
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.documentfile)   // 遍历 SAF 选中的 payload 目录
 
     // 单元测试：协议布局断言有 C 那一份（tools/ipc_layout_test.c），
     // 这里跑的是 Kotlin 侧解析器——上游改了 printf 格式，红的是这些用例。

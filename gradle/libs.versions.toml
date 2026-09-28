@@ -58,6 +58,10 @@ compose-foundation = { module = "androidx.compose.foundation:foundation" }
 # 但 Extension / Security / VisibilityOff 只在 extended。
 # 挂错的报错是 "Unresolved reference: Extension"，不会提示换依赖。
 compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
+# 遍历 SAF 目录 Uri（payload 是一个目录，不是单文件）。
+# 用 SAF 的 DocumentFile 而不是自己去拼 DocumentsContract 查询——后者代码量
+# 大得多，而且很容易在某个 ROM 的 DocumentsProvider 上踩空。
+androidx-documentfile = { module = "androidx.documentfile:documentfile", version = "1.1.0" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

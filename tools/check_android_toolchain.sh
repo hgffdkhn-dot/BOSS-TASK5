@@ -292,6 +292,45 @@ if [ -f "$ROOT/app/src/main/AndroidManifest.xml" ]; then
 fi
 
 echo
+echo "== 4.9) veritpath 对接（JNI 符号族 / vendored 源码）=="
+# 这一组是任务7 新加的。三条都是"编译链接打包全绿、只在运行时炸"的类型，
+# 所以在开编之前静态查一次最划算。
+VP_DIR="$ROOT/app/src/main/cpp/veritpath"
+VP_JAVA="$ROOT/app/src/main/java/dev/veritpath/Veritpath.java"
+if [ ! -d "$VP_DIR" ] || [ ! -f "$VP_JAVA" ]; then
+    warn "没有 vendored veritpath —— 修补页会拿不到 .so"
+else
+    # ① JNI 符号族：Java 的包名.class 必须和 C 里的 Java_<pkg>_<cls>_<method> 对上。
+    #    把 Veritpath.java 挪到 com.boss.manager 下是很自然的整理动作，
+    #    但改完 C 侧不跟着改，编译、链接、打包三步全绿，
+    #    只在 System.loadLibrary 之后抛 UnsatisfiedLinkError。
+    jp=$(grep -m1 -E '^package ' "$VP_JAVA" | sed 's/package \(.*\);/\1/')
+    want="Java_$(printf '%s' "$jp" | tr '.' '_')_Veritpath"
+    got=$(grep -ohE 'Java_[A-Za-z0-9_]+_native[A-Za-z]*' "$VP_DIR/veritpath_jni.c" | head -1)
+    case "$got" in
+        "$want"*) ok "JNI 符号族对得上（$jp.Veritpath ↔ ${got%_native*}）" ;;
+        *) bad "JNI 符号族不匹配：Java 包是 $jp，C 侧却是 ${got%_native*}"
+           echo "          两者必须一致，否则运行时 UnsatisfiedLinkError（编译不会报错）" ;;
+    esac
+
+    # ② VP_NO_MAIN：不定义它，CLI 的 main() 会被链进 .so。
+    grep -q 'VP_NO_MAIN' "$VP_DIR/CMakeLists.txt" \
+        && ok "CMake 里定义了 VP_NO_MAIN（不会把 CLI 的 main 链进 .so）" \
+        || bad "CMake 缺 VP_NO_MAIN —— .so 里会多一个 main 符号"
+
+    # ③ vendored 源码完整性：漏拷一个 .c 的后果是链接期 undefined reference，
+    #    但如果漏的是 vp.h 里声明的东西，现象会更怪。列出来比对最稳。
+    n_c=$(ls "$VP_DIR"/src/*.c 2>/dev/null | wc -l)
+    if [ "$n_c" -lt 9 ]; then
+        bad "vendored 源码只有 $n_c 个 .c（上游是 9 个）—— 复制时漏了"
+    else
+        ok "vendored 源码 $n_c 个 .c + vp.h"
+    fi
+    vpv=$(grep -hoE 'VP_VERSION "[0-9.]+"' "$VP_DIR"/src/vp.h 2>/dev/null | head -1)
+    echo "  ->   上游版本：${vpv:-未读到}（上游更新后这里的数字会变，可作为漂移信号）"
+fi
+
+echo
 echo "== 5) SDK（没有 ANDROID_HOME 就跳过）=="
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [ -z "$SDK" ] || [ ! -d "$SDK" ]; then

@@ -25,3 +25,19 @@ target_compile_options(bossipc PRIVATE
 target_compile_definitions(bossipc PRIVATE BOSS_MANAGER_PKG="com.boss.manager")
 
 target_link_libraries(bossipc log)
+
+# ---- veritpath：镜像分析与注入（任务7 对接）----
+#
+# 只 add_subdirectory，**不** target_link_libraries 到 bossipc。
+# 两个 .so 完全独立：
+#   libbossipc.so   —— 与 bossd 说话（运行时管理）
+#   libveritpath.so —— 分析与修补 boot 镜像（装机期/OTA 后）
+# 各自被 Java 侧 System.loadLibrary 单独加载。
+#
+# 为什么不链起来：
+#   bossipc 的设计约束是"薄"——它只做 IPC，任何多余依赖都是负担。
+#   而且 veritpath 是装机期才用得上的东西，让它常驻在管理链路里没有意义。
+#   AGP 会把 CMake 产出的所有 .so 都打进 APK，所以不链接也照样会被打包。
+#
+# ⚠️ VP_NO_MAIN 等定义在 veritpath/CMakeLists.txt 里，别在这里重复。
+add_subdirectory(veritpath)

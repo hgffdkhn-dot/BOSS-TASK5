@@ -25,6 +25,9 @@ Magisk 式 root 管理器 BOSS 的 su 子系统与关键组件：主打**隐蔽�
 镜像注入交给上游的 veritpath。
 
 - **任务6（客户端）的交付说明**：`docs/TASK6-BOSS客户端-解析与交付.md`
+- **任务7（veritpath 对接）**：`docs/TASK7-veritpath对接.md`
+  （⚠️ veritpath 源码是 **vendored** 进 `app/src/main/cpp/veritpath/` 的，
+  上游更新不会自动跟过来，同步方法见该文档第 6 节）
 - **任务6（客户端）接手先看**：`docs/HANDOFF-TASK6-客户端.md`（操作手册：
   三条硬约束、接口契约、别做错的事）
 - 任务5 的**交付说明**：`docs/TASK5-无修改系统逻辑与特典逻辑.md`（设计推演）
@@ -231,6 +234,7 @@ boss ping                       探活
 | 4. SELinux 解决 | ✅ 已交付（255 条规则 + 引擎 + 早期注入接线，未上真机） |
 | 5. 无修改系统逻辑与特典逻辑 | ✅ 已交付（systemless / hide / hijack 补完，部分需真机验） |
 | 6. BOSS 客户端与对接修补 | ✅ 已交付（App + manager 身份 + 授权弹窗；真机待验）|
+| 7. veritpath App 侧对接 | ✅ 已对接（JNI 库 + 修补页；NDK 编译与真机待验）|
 | 7. 长期开发 | ⬜ |
 
 已知最大限制：v0.2 的 init 接管（SwitchRoot 劫持）**代码已补齐但只能在真机验**。
