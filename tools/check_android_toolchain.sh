@@ -19,8 +19,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
 fails=0; warns=0
+failed_items=""          # 收集失败项，末尾汇总（CI 日志常被截断，只留个数字等于白跑）
 ok()   { echo "  ok    $1"; }
-bad()  { echo "  FAIL  $1"; fails=$((fails+1)); }
+bad()  { echo "  FAIL  $1"; fails=$((fails+1)); failed_items="$failed_items\n    - $1"; }
 warn() { echo "  warn  $1"; warns=$((warns+1)); }
 
 ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
@@ -201,10 +202,28 @@ else
     ls -d "$SDK"/build-tools/36.0.0 >/dev/null 2>&1 \
         && ok "build-tools 36.0.0 已装" \
         || warn "缺 build-tools 36.0.0（AGP 9.1.1 的默认版本）"
-    if ls -d "$SDK"/platforms/android-37.* >/dev/null 2>&1; then
-        warn "android-37 只以次要版本形式存在（android-37.x）。"
-        echo "        若报 Failed to find target with hash string 'android-37'，"
-        echo "        在 android{} 里补一行 compileSdkMinor = 0（要求 AGP ≥ 9.1.0）。"
+    # 次要版本：**列出来**，而不是笼统提示。
+    #   android-37 常常只以 android-37.0 / 37.1 的形式发行。
+    #   AGP 找的是精确 hash：compileSdkMinor=0 → android-37.0，=1 → android-37.1。
+    #   装了 37.1 却写 0，报的是同一句 "Failed to find target with hash string ..."，
+    #   很容易被误判成"平台没装上"——其实装了，只是号码不对。
+    minors=$(ls -d "$SDK"/platforms/android-37.* 2>/dev/null \
+             | sed 's#.*/android-37\.##' | sort -n | tr '\n' ' ')
+    if [ -n "$minors" ]; then
+        echo "  ->   已装的 37 次要版本：${minors}"
+        first=$(echo "$minors" | awk '{print $1}')
+        cur=$(grep -m1 -E '^ *compileSdkMinor *=' "$ROOT/app/build.gradle.kts" 2>/dev/null \
+              | grep -oE '[0-9]+')
+        if [ -z "$cur" ]; then
+            warn "没写 compileSdkMinor，但平台只有 android-37.x ——"
+            echo "        AGP 会去找不存在的 'android-37' 并报 Failed to find target。"
+            echo "        在 android{} 里加：compileSdkMinor = $first"
+        elif [ "$cur" != "$first" ]; then
+            warn "compileSdkMinor=$cur，但装的是 android-37.$first —— 号码不一致，"
+            echo "        同样会报 Failed to find target。改成 $first。"
+        else
+            ok "compileSdkMinor=$cur 与已装的 android-37.$cur 对得上"
+        fi
     fi
 fi
 
@@ -214,6 +233,13 @@ if [ "$fails" = "0" ]; then
     echo "      gradle :app:assembleDebug"
 else
     echo "结果：FAIL=$fails（warn=$warns）。"
-    echo "      修掉 FAIL 再编，否则会在 checkDebugAarMetadata 撞一整墙报错。"
+    echo
+    # 汇总放在最后：CI 日志动辄几百行，失败项散在中间很容易被截断掉，
+    # 只剩一句 "结果：FAIL=1" 却不知道是哪一项——那就等于白跑。
+    # （这次就吃了一次这个亏：只看到 FAIL=1，看不到是谁 FAIL。）
+    echo "失败项："
+    printf "$failed_items\n"
+    echo
+    echo "修掉这些再编，否则会在 checkDebugAarMetadata / processDebugResources 撞一整墙报错。"
 fi
 exit "$fails"

@@ -138,6 +138,25 @@ jobs:
           echo "已装平台：";     ls "$SDK"/platforms    2>/dev/null || echo "  （读不到）"
           echo "已装 build-tools："; ls "$SDK"/build-tools 2>/dev/null || echo "  （读不到）"
 
+      - name: 对齐 compileSdkMinor 与实际装上的平台
+        # API 37 只以次要版本发行（android-37.0 / 37.1），没有裸的 android-37。
+        # AGP 找的是精确 hash：写 0 就找 37.0，写 1 就找 37.1。
+        # 号码对不上时报 "Failed to find target with hash string ..."，
+        # 和"平台根本没装"是同一句话——所以这里直接读实际装了哪个，
+        # 改掉文件里那个默认值，并把改了什么打出来。
+        run: |
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+          minor=$(ls -d "$SDK"/platforms/android-37.* 2>/dev/null \
+                  | sed 's#.*/android-37\.##' | sort -n | head -1)
+          if [ -z "$minor" ]; then
+            echo "[warn] 没找到 android-37.x —— 保留文件里的默认值，交给编译阶段判断"
+            echo "       已装平台：$(ls "$SDK"/platforms 2>/dev/null | tr '\n' ' ')"
+          else
+            echo "检测到 android-37.$minor —— 把 compileSdkMinor 对齐为 $minor"
+            sed -i "s/^ *compileSdkMinor = .*/    compileSdkMinor = $minor/" app/build.gradle.kts
+            grep -n 'compileSdkMinor' app/build.gradle.kts | grep -v '\*'
+          fi
+
       - name: 取一个确定版本的 Gradle
         # 仓库里没有 gradlew wrapper —— wrapper 的 jar 是二进制，我这边生成不了。
         # 所以显式下载固定版本，而不是依赖 runner 预装的 gradle：

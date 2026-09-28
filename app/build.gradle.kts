@@ -37,6 +37,21 @@ android {
      *   否则 AGP 连目标都找不到。 */
     compileSdk = 37
 
+    /* compileSdkMinor 为什么必须写：
+     *   API 37 只以**次要版本**形式发行（android-37.0 / android-37.1），
+     *   没有不带后缀的 android-37。AGP 找的是精确 hash——
+     *   不写这行它就去找 'android-37'，必然报
+     *     Failed to find target with hash string 'android-37'
+     *   而这句报错非常容易被误读成"平台没装上"，其实装了，只是号码不对。
+     *
+     * ⚠️ 这里写 0 只是默认值。**装的是 37.1 就必须写 1**：
+     *   compileSdkMinor=0 → android-37.0；=1 → android-37.1。
+     *   号码不一致报的是同一句话，看不出差别。
+     *   本地自查：bash tools/check_android_toolchain.sh（会列出实际装了哪些 37.x）
+     *   CI：apk job 里有个步骤会自动把这里改成实际装上的那个号码。
+     *   要求 AGP ≥ 9.1.0。 */
+    compileSdkMinor = 0
+
     defaultConfig {
         applicationId = "com.boss.manager"
         minSdk = 26
