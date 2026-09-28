@@ -133,6 +133,10 @@ class PatchRepository(private val app: Context) {
     suspend fun analyze(imagePath: String): Veritpath.Result =
         run("analyze", "--brief", "--boot", imagePath)
 
+    /** 按指定 flag 分析（--init-boot / --boot / ...）。 */
+    suspend fun analyzeWith(imagePath: String, flag: String): Veritpath.Result =
+        run("analyze", "--brief", flag, imagePath)
+
     /** 分析并取 JSON：`analyze --json --boot <path>` */
     suspend fun analyzeJson(imagePath: String): String =
         withContext(singleThread) {
@@ -147,16 +151,58 @@ class PatchRepository(private val app: Context) {
         run("payload-check", dir)
 
     /**
-     * 注入：`inject <image> -p <payloadDir> -o <outDir>`
+     * 按给定分区角色分析一次，用来确认"这个镜像里到底有没有 ramdisk"。
      *
-     * ⚠️ 注意上游 `Veritpath.inject(payloadDir, outputPath, images)` 的参数顺序：
-     * Java 侧把 images 放在最前面，-p/-o 放后面。传错顺序不会报错，
-     * 只是行为完全不对（会把镜像路径当 payload 目录读）。
+     * ⚠️ 关于 TARGET 的一个实测结论，很重要：
+     *    TARGET 字段**只是回显你传进去的 role**，不是真正的分区识别——
+     *      analyze --init-boot X  → TARGET:init_boot
+     *      analyze --boot 同一份 X → TARGET:boot
+     *    唯一有判断价值的是 **TARGET:none**（镜像里没有 ramdisk）。
+     *    所以"自动识别 boot 还是 init_boot"在这套 CLI 上做不到，
+     *    必须由用户指定——界面上就是那排分区选择。
+     *
+     * ⚠️ 另一个坑：**不要用上游的 `Veritpath.inject()`**。
+     *    它拼出的是 `inject <image> -p <dir> -o <out>`——镜像是裸位置参数，
+     *    而 CLI 的 load_images() 只认 --boot/--init-boot/--vendor-boot/--recovery，
+     *    位置参数被 getopt 直接忽略。后果：没有镜像被加载，退出码 1。
+     *    实测报错：`no input images given (use --boot/--init-boot/--vendor-boot)`
      */
-    suspend fun inject(imagePath: String, payloadDir: String, outDir: String): Veritpath.Result =
-        withContext(singleThread) {
-            lock.withLock { Veritpath.inject(payloadDir, outDir, imagePath) }
+    suspend fun probe(imagePath: String, role: String): Veritpath.Result =
+        run("analyze", "--brief", roleFlag(role), imagePath)
+
+    fun roleFlag(role: String): String = when (role) {
+        "init_boot" -> "--init-boot"
+        "boot" -> "--boot"
+        "vendor_boot" -> "--vendor-boot"
+        "recovery" -> "--recovery"
+        else -> "--init-boot"
+    }
+
+    /**
+     * 注入：`inject <--role> <image> -p <payloadDir> -o <outDir>`
+     *
+     * @param role 由 detectRole() 得到的 ramdisk 所在分区；为 null 时
+     *             依次试 init_boot / boot（代价是两次解析，190MB 的镜像会慢一点）
+     */
+    suspend fun inject(
+        imagePath: String,
+        payloadDir: String,
+        outDir: String,
+        role: String? = null,
+    ): Veritpath.Result = withContext(singleThread) {
+        lock.withLock {
+            if (role != null) {
+                Veritpath.run("inject", roleFlag(role), imagePath,
+                    "-p", payloadDir, "-o", outDir)
+            } else {
+                val a = Veritpath.run("inject", "--init-boot", imagePath,
+                    "-p", payloadDir, "-o", outDir)
+                if (a.ok()) a
+                else Veritpath.run("inject", "--boot", imagePath,
+                    "-p", payloadDir, "-o", outDir)
+            }
         }
+    }
 
     /** 刷之前自检：`verify <image>` */
     suspend fun verify(imagePath: String): Veritpath.Result =

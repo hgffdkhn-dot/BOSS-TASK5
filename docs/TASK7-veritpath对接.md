@@ -82,6 +82,72 @@ payload 是目录，用 `DocumentFile` 递归拷（因此新增了 `androidx.doc
 
 ---
 
+## 3.5 「修补失败，退出码 1，输出无」——真机实测撞到的两个 bug
+
+### ③ 上游 `Veritpath.inject()` 拼错了参数（**主因**）
+
+`jni/dev/veritpath/Veritpath.java` 里的辅助方法拼出来是：
+
+```
+inject <image> -p <dir> -o <out>      ← 镜像是裸位置参数
+```
+
+而 CLI 的 `load_images()` 只认 `--boot / --init-boot / --vendor-boot / --recovery`
+四个 flag，位置参数会被 `getopt_long` 直接忽略。于是**没有镜像被加载**。
+
+用 vendored 源码编出的 CLI 实测：
+
+```
+$ veritpath inject imgs/init_boot.img -p payloads/example-su -o out/
+退出码 1
+stderr: no input images given (use --boot/--init-boot/--vendor-boot)
+
+$ veritpath inject --init-boot imgs/init_boot.img -p payloads/example-su -o out/
+退出码 0 → out/init_boot.veritpath.img
+```
+
+修法：**不用上游那个辅助方法**，自己在 `PatchRepository` 里拼 argv，
+按用户选定的分区类型带 `--init-boot` / `--boot` / `--vendor-boot`。
+
+### ④ 错误信息走 stderr，而捕获只覆盖 stdout（**为什么"输出无"**）
+
+`vp_capture_start()` 只 `dup2` 了 `STDOUT_FILENO`。
+但 veritpath 的全部错误都走 `vp_err()` → **stderr**。
+所以 JNI 侧拿到的是"退出码 1 + 空字符串"。真机上更糟：
+native stderr 在 App 里基本不可见，等于完全没有线索。
+
+（上游 JNI 文件里那句注释 "vp_err writes to stderr ... nothing extra is needed"
+在 Android 上并不成立。）
+
+修法：给 vendored `src/util.c` 打 **BOSS-PATCH**——把 stderr 一起重定向到
+同一个捕获文件。合并顺序不做保证，但"能看到原因"比"顺序好看"重要得多。
+
+打完补丁后实测（同一个 harness）：
+
+```
+[A 上游写法] rc=1
+  captured: veritpath: no input images given (use --boot/--init-boot/--vendor-boot)
+[B --init-boot] rc=0
+```
+
+⚠️ **这是对 vendored 源码的本地修改**。上游同步会覆盖 `util.c`，
+届时这段要重新加。自检脚本 4.9 节会检查 `BOSS-PATCH` 标记还在不在，
+丢了就报 FAIL——不会静默退化成"输出无"。
+
+### 附：TARGET 字段不能用来自动识别分区
+
+实测（同一份镜像，换 flag）：
+
+```
+analyze --brief --init-boot X  → TARGET:init_boot
+analyze --brief --boot      X  → TARGET:boot
+```
+
+**TARGET 只是回显你传进去的 role**，不是分区判别。
+唯一有判断价值的是 `TARGET:none`（镜像里没有 ramdisk）。
+所以"自动识别 boot 还是 init_boot"在这套 CLI 上做不到，
+界面上改成让用户选，默认 `init_boot`（Android 13+ GKI 主流布局）。
+
 ## 4. 仍然不做的事：刷入
 
 「修补」页的终点是**导出修补后的镜像**，之后由用户

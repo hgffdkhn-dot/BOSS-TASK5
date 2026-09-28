@@ -328,6 +328,19 @@ else
     fi
     vpv=$(grep -hoE 'VP_VERSION "[0-9.]+"' "$VP_DIR"/src/vp.h 2>/dev/null | head -1)
     echo "  ->   上游版本：${vpv:-未读到}（上游更新后这里的数字会变，可作为漂移信号）"
+
+    # ④ stderr 捕获补丁还在吗？
+    #    上游 vp_capture_start 只重定向 stdout，而 veritpath 的错误全部走
+    #    vp_err() → stderr。不打补丁的话 JNI 侧拿到的是"退出码 1 + 空输出"，
+    #    界面上表现为"修补失败，输出无"，一句原因都没有。
+    #    上游同步会覆盖 util.c，这个标记丢了就悄悄退化——必须显式检查。
+    if grep -q 'BOSS-PATCH' "$VP_DIR"/src/util.c 2>/dev/null; then
+        ok "stderr 捕获补丁还在（util.c 有 BOSS-PATCH 标记）"
+    else
+        bad "util.c 里没有 BOSS-PATCH —— stderr 捕获被覆盖掉了"
+        echo "          后果：失败时输出为空，界面只剩'退出码 1'。重打补丁见"
+        echo "          docs/TASK7-veritpath对接.md 第 3 节 ④"
+    fi
 fi
 
 echo

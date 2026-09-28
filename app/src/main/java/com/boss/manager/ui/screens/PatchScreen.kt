@@ -39,6 +39,7 @@ fun PatchScreen(vm: PatchViewModel) {
     val analyze by vm.analyze.collectAsStateWithLifecycle()
     val output by vm.output.collectAsStateWithLifecycle()
     val patched by vm.patched.collectAsStateWithLifecycle()
+    val role by vm.role.collectAsStateWithLifecycle()
 
     // ---- SAF：系统文件选择器。选到的是 Uri，不是路径。
     //      路径转换在 PatchRepository 里做（拷进私有缓存）。
@@ -82,6 +83,23 @@ fun PatchScreen(vm: PatchViewModel) {
         }
 
         SectionCard("1 · 镜像") {
+            // 分区类型必须由用户选。CLI 的 TARGET 只是回显传入的 role，
+            // 不是真正的分区判别，所以自动识别做不到——
+            // 而选错的后果是产出一个要刷到错误分区的镜像。
+            Text("分区类型", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(4.dp))
+            Row(Modifier.fillMaxWidth()) {
+                listOf("init_boot", "boot", "vendor_boot").forEach { r ->
+                    FilterChip(
+                        selected = role == r,
+                        onClick = { vm.setRole(r) },
+                        label = { Text(r) },
+                        modifier = Modifier.padding(end = 6.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
             Button(
                 onClick = { pickImage.launch(arrayOf("*/*")) },
                 enabled = !busy,

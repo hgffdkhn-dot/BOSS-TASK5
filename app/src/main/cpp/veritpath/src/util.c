@@ -421,8 +421,29 @@ void vp_report_missing(const char *role, const char *path)
  * than reassigning the stdout FILE*, which is not portable.
  */
 static int g_saved_fd = -1;
+static int g_saved_err_fd = -1;   /* BOSS-PATCH */
 static FILE *g_cap_file = NULL;
 
+/* BOSS-PATCH（开始）
+ *
+ * 上游只把 **stdout** 重定向到捕获文件，stderr 原样留在真 stderr 上。
+ * 而 veritpath 的全部错误信息都走 vp_err() → stderr。
+ * 于是 JNI 侧拿到的是"退出码 1、输出空字符串"——
+ * 界面上表现为"修补失败，输出无"，一句原因都看不到。
+ * 真机上更糟：native stderr 在 App 里基本不可见，等于没有任何线索。
+ *
+ * 实测（vendored 源码编出的 CLI）：
+ *   inject <img> -p dir -o out      → 退出码 1，stdout 空，
+ *                                     stderr: "no input images given (use --boot/...)"
+ * 这正是用户看到的现象。
+ *
+ * 改法：把 stderr 一起重定向到同一个 tmpfile。合并顺序不做保证，
+ * 但"能看到原因"远比"顺序好看"重要。
+ *
+ * ⚠️ 这是**对 vendored 源码的本地修改**。上游同步会把 util.c 覆盖掉，
+ *    届时这段要重新加上。tools/check_android_toolchain.sh 的 4.9 节会检查
+ *    这个标记还在不在——丢了就报 FAIL，不会静默退化成"输出无"。
+ */
 int vp_capture_start(void)
 {
     if (g_cap_file)
@@ -445,17 +466,26 @@ int vp_capture_start(void)
         g_cap_file = NULL;
         return -1;
     }
+    g_saved_err_fd = dup(STDERR_FILENO);                    /* BOSS-PATCH */
+    if (g_saved_err_fd >= 0)                                /* BOSS-PATCH */
+        dup2(fileno(g_cap_file), STDERR_FILENO);            /* BOSS-PATCH */
     return 0;
 }
 
 char *vp_capture_stop(void)
 {
     fflush(stdout);
+    fflush(stderr);                                          /* BOSS-PATCH */
     if (g_saved_fd >= 0) {
         dup2(g_saved_fd, STDOUT_FILENO);
         close(g_saved_fd);
         g_saved_fd = -1;
     }
+    if (g_saved_err_fd >= 0) {                               /* BOSS-PATCH */
+        dup2(g_saved_err_fd, STDERR_FILENO);                 /* BOSS-PATCH */
+        close(g_saved_err_fd);                               /* BOSS-PATCH */
+        g_saved_err_fd = -1;                                 /* BOSS-PATCH */
+    }                                                        /* BOSS-PATCH */
     if (!g_cap_file)
         return NULL;
 

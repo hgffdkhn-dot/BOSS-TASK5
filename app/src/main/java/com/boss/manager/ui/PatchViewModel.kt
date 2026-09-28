@@ -38,6 +38,21 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
     private val _analyze = MutableStateFlow<List<Pair<String, String>>>(emptyList())
     val analyze: StateFlow<List<Pair<String, String>>> = _analyze.asStateFlow()
 
+    /**
+     * 用户选定的分区类型。**默认 init_boot**（Android 13+ GKI 主流布局）。
+     *
+     * 为什么让用户选而不是自动识别：CLI 的 TARGET 字段只是回显传入的 role，
+     * 不是真正的分区判别（实测：同一份镜像传 --boot 就报 TARGET:boot）。
+     * 唯一可靠的信息是 TARGET:none（没 ramdisk）。所以只能由用户指定。
+     */
+    private val _role = MutableStateFlow("init_boot")
+    val role: StateFlow<String> = _role.asStateFlow()
+
+    fun setRole(r: String) {
+        _role.value = r
+        _analyze.value = emptyList()
+    }
+
     private val _output = MutableStateFlow<String?>(null)
     val output: StateFlow<String?> = _output.asStateFlow()
 
@@ -105,10 +120,16 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
     fun analyze() = work {
         val p = _imagePath.value ?: run { _toast.value = "先选一个镜像"; return@work }
-        val r = repo.analyze(p)
+        val r = repo.probe(p, _role.value)
         _output.value = r.output
-        _analyze.value = r.fields("ARCH", "TARGET", "VENDOR", "FORMAT", "PAYLOAD")
-        _toast.value = if (r.ok()) "分析完成" else "分析失败（退出码 ${r.exitCode}）"
+        _analyze.value = r.fields("ARCH", "TARGET", "LAYOUT", "ANDROID", "GKI", "PATCHED")
+        val target = r.line("TARGET")?.trim()
+        _toast.value = when {
+            !r.ok() -> "分析失败（退出码 ${r.exitCode}）—— 看下面输出"
+            target == null || target == "none" ->
+                "这份镜像里没找到 ramdisk（TARGET:none）——换「boot」再试，或确认选对了文件"
+            else -> "分析完成（$target）"
+        }
     }
 
     fun verify(imagePath: String) = work {
@@ -127,7 +148,9 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         val img = _imagePath.value ?: run { _toast.value = "先选一个镜像"; return@work }
         val pay = _payloadDir.value ?: run { _toast.value = "先选 payload 目录"; return@work }
         val out = repo.outputDir()
-        val r = repo.inject(img, pay, out)
+        // inject 的镜像**必须**带 role flag：裸位置参数会被 CLI 完全忽略，
+        // 表现为退出码 1（旧版连原因都看不到，因为错误走 stderr 未被捕获）。
+        val r = repo.inject(img, pay, out, _role.value)
         _output.value = r.output
         _patched.value = repo.outputs()
         _toast.value = if (r.ok()) "修补完成，导出后用 fastboot 刷入"
