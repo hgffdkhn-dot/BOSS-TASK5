@@ -151,10 +151,17 @@ except Exception:
             return 1   # 剥不掉：交给调用方跳过
         fi
     }
+    # ⚠️ 一定要报出**具体文件和行号**。
+    #   只报属性名（"?attr/xxx 未声明"）害人不浅：
+    #   上一轮就因为没报文件，我把"某个 res 文件里的真引用"误判成了
+    #   "注释里的假警报"，白改一轮还下错结论。
+    #   同一种报错，可能是注释、可能是真代码、可能是没同步过去的旧文件——
+    #   不给路径就只能猜。
     if command -v python3 >/dev/null 2>&1 || command -v perl >/dev/null 2>&1; then
         hits=$(find "$res_dir" -type f -name '*.xml' 2>/dev/null \
-               | while read -r f; do strip_comments "$f" || true; done \
-               | grep -ohE '\?attr/[A-Za-z_][A-Za-z0-9_]*' | sort -u)
+               | while read -r f; do
+                     strip_comments "$f" 2>/dev/null | grep -HnE '\?attr/' --label="$f" || true
+                 done)
     else
         hits=""
         warn "没有 python3 也没有 perl，剥不掉 XML 注释——跳过这项检查"
@@ -163,18 +170,27 @@ except Exception:
     if [ -z "$hits" ]; then
         ok "res/ 里没有 ?attr/ 引用"
     else
-        for h in $hits; do
-            name=${h#\?attr/}
-            # 有没有在 res/values 里声明过？
+        # ⚠️ 不能用 `echo "$hits" | while ...`：
+        #   管道会把 while 放进**子 shell**，里面的 fails=fails+1 出了子 shell 就没了。
+        #   后果极坏——明明打印了 FAIL，结尾却报"结果：PASS"，CI 就放过去了。
+        #   （刚刚改这行时真的踩了一次：FAIL 打出来了，退出码却是 0。）
+        #   用 here-string，while 留在当前 shell 里，计数才准。
+        while IFS= read -r line; do
+            f=${line%%:*}; rest=${line#*:}; ln=${rest%%:*}; txt=${rest#*:}
+            name=$(printf '%s' "$txt" | grep -oE '\?attr/[A-Za-z_][A-Za-z0-9_]*' | head -1)
+            name=${name#\?attr/}
+            short=${f#$ROOT/}
             if grep -rqE "<attr name=\"$name\"" "$res_dir"/values/ 2>/dev/null; then
-                ok "$h —— 已在 res/values 声明"
+                ok "$short:$ln  $name —— 已在 res/values 声明"
             else
-                bad "$h 未声明。纯 Compose 项目里它必然链接失败："
-                echo "          要么在 res/values 声明这个 attr，"
-                echo "          要么（图标场景）直接写死颜色——图标在 launcher 进程加载，"
-                echo "          用 ?attr 解析的结果不由我们决定。"
+                bad "$short:$ln  用了 ?attr/$name，但未声明"
+                echo "          纯 Compose 项目里它必然链接失败。两条路："
+                echo "            · 在 res/values 里声明这个 attr"
+                echo "            · 图标场景直接写死颜色——图标在 launcher 进程加载，"
+                echo "              用 ?attr 解析成什么都不由我们决定"
+                echo "          若这个文件已不再被 Manifest 引用，直接删掉它。"
             fi
-        done
+        done <<< "$hits"
     fi
     # launcher 图标必须是自适应图标（API 26+），否则在 Android 8+ 桌面上
     # 不会被遮罩裁切，形状与邻居不一致。
@@ -208,6 +224,37 @@ if [ -n "${GRADLE_VER:-}" ]; then
         || bad "Gradle $GRADLE_VER < 9.3.1 —— AGP 9.1.1 的硬下限，sync 阶段就会挂"
 else
     echo "  skip  没设 GRADLE_VER（CI 会传进来；本地若用 wrapper 可忽略）"
+fi
+
+echo
+echo "== 4.8) 有没有残留的旧图标文件 =="
+# 图标从 @drawable/ic_boss 换成 @mipmap/ic_launcher 之后，
+# 旧文件如果不删，它仍然会被 aapt 编译进 APK——
+# 于是"Manifest 已经改对了、自检也报 ok"但资源链接照样失败。
+# 而且旧文件不在任何引用链上，看 Manifest 永远发现不了它。
+stale=""
+for f in drawable/ic_boss.xml drawable/ic_launcher.xml; do
+    [ -f "$ROOT/app/src/main/res/$f" ] && stale="$stale $f"
+done
+if [ -n "$stale" ]; then
+    bad "残留旧图标文件：$stale"
+    echo "      这些文件已不被 Manifest 引用，但仍会被编译。删掉它们。"
+else
+    ok "没有残留的旧图标文件"
+fi
+# 顺带确认所有 drawable 都能被解析到（防止引用了已删掉的东西）
+if [ -f "$ROOT/app/src/main/AndroidManifest.xml" ]; then
+    miss=""
+    while IFS= read -r ref; do
+        [ -z "$ref" ] && continue
+        d=$(printf '%s' "$ref" | sed 's#@\([a-z]*\)/##')
+        # @mipmap 在 mipmap-anydpi-v26，@drawable 在 drawable/
+        case "$ref" in
+            @mipmap/*) [ -e "$ROOT/app/src/main/res/mipmap-anydpi-v26/$d.xml" ] || miss="$miss $ref" ;;
+            @drawable/*) [ -e "$ROOT/app/src/main/res/drawable/$d.xml" ] || miss="$miss $ref" ;;
+        esac
+    done <<< "$(grep -oE '@(mipmap|drawable)/[A-Za-z0-9_]+' "$ROOT/app/src/main/AndroidManifest.xml")"
+    [ -z "$miss" ] && ok "Manifest 引用的图标都存在" || bad "Manifest 引用了不存在的文件：$miss"
 fi
 
 echo

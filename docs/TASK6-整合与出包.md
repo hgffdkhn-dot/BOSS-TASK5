@@ -418,6 +418,46 @@ ok    android:icon 指向 @mipmap（自适应图标）
 | 正常环境 | PASS |
 | 故意塞一个真引用 | 抓出 FAIL 并进汇总 |
 
+### 自检报了 FAIL，却不知道是哪个文件（我上一轮判断错了）
+
+上一轮我看到 `FAIL ?attr/colorControlNormal 未声明`，判断是"注释里的假警报"。
+**这个判断是错的。** 真实情况：独立仓里**还留着旧的 `drawable/ic_boss.xml`**，
+它第 12 行有**真引用** `android:tint="?attr/colorControlNormal"`。
+
+我当时只删了全量包里的那份，没删独立仓的。而两个仓库的 res 目录此后就**漂移**了。
+
+> ⚠️ 旧文件的隐蔽性在于：Manifest 已经改成 `@mipmap/ic_launcher` 了，
+> 看 Manifest 一切正常、自检报"icon 指向 @mipmap ✓"——
+> 但旧文件不在任何引用链上，**照样会被 aapt 编译进 APK**，
+> 于是资源链接照样失败，而且从引用关系上永远发现不了它。
+
+**根因是我的检查只报属性名、不报文件路径。** 同一种报错可能是：
+注释里的反面例子 / 真代码引用 / 没同步过去的旧文件——不给路径就只能猜。
+
+改了三处：
+
+1. **报出 `文件:行号`**（关键）
+   ```
+   FAIL  app/src/main/res/drawable/ic_boss.xml:8  用了 ?attr/colorControlNormal，但未声明
+   ```
+2. **新增 4.8 节**：专门查残留的旧图标文件 + Manifest 引用是否都存在。
+3. **两边仓库 res 目录强制同步**，并加了 `diff` 校验步骤。
+
+### 顺带修了一个会让 CI 放行的严重 bug
+
+改上面那行时我写了 `echo "$hits" | while ...`，结果：
+
+```
+FAIL  app/src/main/res/drawable/ic_boss.xml:8 ...
+结果：PASS（warn=0）        ← 明明有 FAIL 却报 PASS！
+```
+
+**管道把 `while` 放进了子 shell**，里面的 `fails=fails+1` 出了子 shell 就丢了。
+后果极坏——日志里打了 FAIL，退出码却是 0，**CI 会把它放过去**。
+
+改成 `done <<< "$hits"`（here-string），`while` 留在当前 shell，计数才准。
+已实测：有真问题时退出码 1，干净时 0。
+
 ### android-37 只有次要版本，必须写 `compileSdkMinor`
 
 CI 上终于装上了 android-37，但自检报：
