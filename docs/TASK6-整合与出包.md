@@ -18,6 +18,50 @@
 所以这次做的是**静态交叉检查**（符号引用、依赖声明、跨 package import），查出三个
 必然会让第一次真编译红掉的缺口：
 
+### ⓪ launcher 图标用了 AppCompat 的属性（最近这次的报错）
+
+```
+Android资源链接失败
+com.boss.manager.app-main-41:/drawable/ic_boss.xml:12:
+  错误：找不到资源 attr/colorControlNormal
+```
+
+`?attr/colorControlNormal` 是 **AppCompat** 定义的属性。BOSS 是纯 Compose 项目，
+**不依赖 appcompat**，所以它在我们自己的包名下根本不存在 —— 链接直接失败。
+
+修的时候要同时想清楚两条，第二条更要命：
+
+1. **构建期**：加 `android:` 前缀（`?android:attr/colorControlNormal`，框架属性，
+   API 21 有）能编过。但——
+2. **运行期**：**launcher 图标是在 launcher 进程里加载的，用 launcher 的 theme，
+   不是我们的。** 任何 `?attr/` 在那里解析成什么都不由我们决定，
+   同一份图标在不同 launcher 上颜色会不一样，甚至解析失败。
+   → **launcher 图标必须写死颜色，没有例外。**
+
+顺带修了一个没报错但不对的地方：原来直接把 24dp 矢量图当 `android:icon`，
+那样在 Android 8+ 上**不会被遮罩裁切**，图标"裸"着显示，
+在别的图标都是统一形状的桌面上很扎眼——对主打低痕迹的产品是反效果。
+现在改成标准自适应图标：
+
+```
+drawable/ic_launcher_foreground.xml    108dp viewport，内容收在中心 66dp 安全区
+drawable/ic_launcher_background.xml    108dp 满铺
+mipmap-anydpi-v26/ic_launcher.xml      adaptive-icon
+mipmap-anydpi-v26/ic_launcher_round.xml
+```
+
+minSdk 就是 26，所以**不需要** PNG 回退，`mipmap-anydpi-v26` 已覆盖全部受支持设备。
+
+配色取自 `Theme.kt` 里 BossDark 的回退色（`surface #FF101415` / `primary #FF9ECAFF`），
+低饱和中性色，不给 BOSS 造一个能被认出来的招牌色。
+
+**自检脚本加了 3.7 节专门守这个**：扫 `res/` 里的 `?attr/`，
+没在 `res/values` 声明就报 FAIL；并顺带检查 `android:icon` 是否指向 `@mipmap`
+（指向 `@drawable` 说明不是自适应图标）。
+
+> 实现细节：扫描前先剥掉 XML 注释。注释里把 `?attr/colorControlNormal`
+> 当反面例子写着，不剥掉就永远误报——已实测能抓真问题、不误报注释。
+
 ### ① 全量包里根本没有 Gradle 构建骨架（最严重）
 
 合并时只复制了 `app/`，而 `settings.gradle.kts`、根 `build.gradle.kts`、

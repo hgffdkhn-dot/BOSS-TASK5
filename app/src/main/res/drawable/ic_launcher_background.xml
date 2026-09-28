@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标背景：铺满整个 108dp，由 launcher 的遮罩裁成圆/方/水滴等形状。
+  颜色与前景的内盾一致（Theme.kt BossDark.surface），这样"描边"效果是连贯的。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FF101415"
+        android:pathData="M0,0 H108 V108 H0 Z" />
+</vector>

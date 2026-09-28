@@ -110,6 +110,62 @@ else
 fi
 
 echo
+echo "== 3.7) 资源里的主题属性引用（launcher 图标专属雷区）=="
+# `?attr/xxx`（不带 android: 前缀）在我们自己的包名下解析。
+# 它要求 xxx 由某个库（AppCompat / Material Components）或我们自己的
+# res/values 声明出来。纯 Compose 项目两个都没有，于是直接链接失败：
+#   错误：找不到资源 attr/colorControlNormal
+#
+# 就算换成 ?android:attr/xxx（框架属性，能编过）也**不能用在 launcher 图标上**——
+# 图标是在 launcher 进程里加载的，用 launcher 的 theme 解析，
+# 不由我们决定。所以图标里一律写死颜色。
+res_dir="$ROOT/app/src/main/res"
+if [ ! -d "$res_dir" ]; then
+    echo "  skip  没有 res 目录"
+else
+    # 必须先剥掉 XML 注释再扫：
+    #   注释里引用了 "?attr/colorControlNormal" 作为反面例子，
+    #   不剥掉的话这条检查会永远报 FAIL——假警报比没警报更烦人。
+    #   （上一版 gradle.properties 那条也栽过同样的坑。）
+    strip_comments() {
+        if command -v perl >/dev/null 2>&1; then
+            perl -0777 -pe 's/<!--.*?-->//gs' "$1" 2>/dev/null
+        else
+            cat "$1"
+        fi
+    }
+    hits=$(find "$res_dir" -type f -name '*.xml' 2>/dev/null \
+           | while read -r f; do strip_comments "$f"; done \
+           | grep -ohE '\?attr/[A-Za-z_][A-Za-z0-9_]*' | sort -u)
+    if [ -z "$hits" ]; then
+        ok "res/ 里没有 ?attr/ 引用"
+    else
+        for h in $hits; do
+            name=${h#\?attr/}
+            # 有没有在 res/values 里声明过？
+            if grep -rqE "<attr name=\"$name\"" "$res_dir"/values/ 2>/dev/null; then
+                ok "$h —— 已在 res/values 声明"
+            else
+                bad "$h 未声明。纯 Compose 项目里它必然链接失败："
+                echo "          要么在 res/values 声明这个 attr，"
+                echo "          要么（图标场景）直接写死颜色——图标在 launcher 进程加载，"
+                echo "          用 ?attr 解析的结果不由我们决定。"
+            fi
+        done
+    fi
+    # launcher 图标必须是自适应图标（API 26+），否则在 Android 8+ 桌面上
+    # 不会被遮罩裁切，形状与邻居不一致。
+    if grep -q 'android:icon' "$ROOT/app/src/main/AndroidManifest.xml" 2>/dev/null; then
+        if grep -qE 'android:icon="@drawable/' "$ROOT/app/src/main/AndroidManifest.xml"; then
+            warn "android:icon 指向 @drawable —— Android 8+ 上不会被遮罩裁切，"
+            echo "          桌面图标形状会和别人不一致。用 @mipmap/ic_launcher + adaptive-icon。"
+        else
+            ok "android:icon 指向 @mipmap（自适应图标）"
+        fi
+    fi
+fi
+
+echo
 echo "== 4) gradle.properties =="
 # 只匹配**生效的**那一行：文件里有一大段注释在解释"为什么别写它"，
 # 直接 grep 关键字会命中注释，于是永远报 warn——假警报比没警报更烦人。
@@ -118,6 +174,17 @@ if grep -E '^[^#]*suppressUnsupportedCompileSdk' "$ROOT/gradle.properties" 2>/de
     echo "         压不掉 AAR 元数据硬校验。别指望它解决这堆报错。"
 else
     ok "没有 suppressUnsupportedCompileSdk（压了也没用，反而少一条线索）"
+fi
+
+echo
+echo "== 4.5) Gradle 版本（AGP 9.1.1 的硬下限是 9.3.1）=="
+if [ -n "${GRADLE_VER:-}" ]; then
+    echo "  GRADLE_VER = $GRADLE_VER（来自环境）"
+    ver_ge "$GRADLE_VER" "9.3.1" \
+        && ok "Gradle $GRADLE_VER ≥ 9.3.1" \
+        || bad "Gradle $GRADLE_VER < 9.3.1 —— AGP 9.1.1 的硬下限，sync 阶段就会挂"
+else
+    echo "  skip  没设 GRADLE_VER（CI 会传进来；本地若用 wrapper 可忽略）"
 fi
 
 echo

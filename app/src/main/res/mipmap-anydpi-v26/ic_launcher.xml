@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标（Android 8.0 / API 26+）。
+
+  minSdk 就是 26，所以**不需要**为旧版本准备 PNG 回退 ——
+  mipmap-anydpi-v26 已经覆盖全部受支持的设备。
+
+  ⚠️ 之前是直接把 24dp 矢量图当 android:icon 用：
+     那样在 Android 8+ 上不会被遮罩裁切，图标会"裸"着显示，
+     在别的图标都是统一形状的桌面上非常扎眼——
+     对一个主打低痕迹的产品来说是反效果。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  BOSS · 自适应图标前景
+
+  ⚠️ 这个文件**绝对不能**用 ?attr/ 取色。原因有两条，第二条更要命：
+
+  1. 构建期：`?attr/colorControlNormal` 是 **AppCompat** 定义的属性。
+     BOSS 是纯 Compose 项目，不依赖 appcompat，所以它在我们自己的包名下
+     根本不存在 —— 报 "找不到资源 attr/colorControlNormal"。
+     加 `android:` 前缀（?android:attr/...）能编过，但见第 2 条。
+
+  2. 运行期（真原因）：**launcher 图标是在 launcher 进程里加载的，
+     用的是 launcher 的 theme，不是我们的。**
+     任何 ?attr/ 在那里解析的结果都不由我们决定，
+     同一份图标在不同 launcher 上颜色会不一样，甚至解析失败。
+     所以 launcher 图标必须写死颜色，没有例外。
+
+  规格：viewport 108dp（自适应图标标准），内容收在中心 66dp 安全区内，
+  这样被任何形状的遮罩裁切都不会少角。
+  本图内容范围 x 30~78、y 22.5~85.5，安全区是 21~87 ✓
+
+  配色取自 Theme.kt 里 BossDark 的回退色（surface / primary），
+  低饱和中性色 —— 不给 BOSS 造一个能被认出来的"招牌色"。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 外盾 -->
+    <path
+        android:fillColor="#FF9ECAFF"
+        android:pathData="M54,22.5 L30,34.5 V52.5 C30,69 40.2,81.6 54,85.5 C67.8,81.6 78,69 78,52.5 V34.5 L54,22.5 Z" />
+
+    <!-- 内盾：涂成背景色，形成"描边"效果。
+         为什么不用 fillType="evenOdd" 挖洞：那依赖两条 path 的绕向一致，
+         绕向一变就整块实色，且看不出来。直接涂背景色更稳。 -->
+    <path
+        android:fillColor="#FF101415"
+        android:pathData="M54,29.1 L72,37.8 V52.5 C72,65.1 64.2,75.6 54,79.5 C43.8,75.6 36,65.1 36,52.5 V37.8 L54,29.1 Z" />
+
+    <!-- 中心闪电 -->
+    <path
+        android:fillColor="#FF9ECAFF"
+        android:pathData="M51,46.5 H45 V58.5 H51 V64.5 H57 V58.5 H63 V46.5 H57 V40.5 H51 V46.5 Z" />
+</vector>
