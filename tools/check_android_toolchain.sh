@@ -13,10 +13,37 @@
 #   它不需要 Android SDK：文件层面的检查全部能做。
 #   有 ANDROID_HOME 时额外查平台与 build-tools 装没装。
 #
-# 用法：bash tools/check_android_toolchain.sh
+# 用法：
+#   bash tools/check_android_toolchain.sh          只检查
+#   bash tools/check_android_toolchain.sh --fix     检查并自动清掉残留的旧图标
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+
+# --fix：自动清掉残留的旧图标文件。
+#   为什么要有它：这类文件不在任何引用链上，Manifest 看着完全正常，
+#   手工排查永远发现不了它——但 aapt 照样编译它，资源链接照样失败。
+#   让脚本自己删，比让人去猜"到底哪个文件没同步"可靠。
+FIX=0
+[ "${1:-}" = "--fix" ] && FIX=1
+
+# --fix 时**先**清残留，再扫描。
+#   反过来的话 3.7 会先报 FAIL、4.8 才删掉文件——同一轮里前后矛盾，
+#   看着像"修了但没修好"，还会让人以为要跑两遍。
+if [ "$FIX" = "1" ]; then
+    cleaned=""
+    for f in drawable/ic_boss.xml drawable/ic_launcher.xml; do
+        if [ -f "$ROOT/app/src/main/res/$f" ]; then
+            rm -f "$ROOT/app/src/main/res/$f"; cleaned="$cleaned $f"
+        fi
+    done
+    if [ -n "$cleaned" ]; then
+        echo "[--fix] 已删除残留旧图标文件：$cleaned"
+        echo "        记得 git add -A 把这个删除提交进去。"; echo
+    else
+        echo "[--fix] 没有残留的旧图标文件"; echo
+    fi
+fi
 
 fails=0; warns=0
 failed_items=""          # 收集失败项，末尾汇总（CI 日志常被截断，只留个数字等于白跑）
@@ -237,8 +264,15 @@ for f in drawable/ic_boss.xml drawable/ic_launcher.xml; do
     [ -f "$ROOT/app/src/main/res/$f" ] && stale="$stale $f"
 done
 if [ -n "$stale" ]; then
-    bad "残留旧图标文件：$stale"
-    echo "      这些文件已不被 Manifest 引用，但仍会被编译。删掉它们。"
+    if [ "$FIX" = "1" ]; then
+        # 理论上到不了这里：--fix 已在脚本开头清过一遍
+        ok "仍有残留（--fix 已尝试清理，可能被占用）：$stale"
+    else
+        bad "残留旧图标文件：$stale"
+        echo "      这些文件已不被 Manifest 引用，但仍会被编译。两条路："
+        echo "        · bash tools/check_android_toolchain.sh --fix   （自动删）"
+        echo "        · rm app/src/main/res/drawable/ic_boss.xml      （手动删）"
+    fi
 else
     ok "没有残留的旧图标文件"
 fi

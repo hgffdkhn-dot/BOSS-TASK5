@@ -458,6 +458,34 @@ FAIL  app/src/main/res/drawable/ic_boss.xml:8 ...
 改成 `done <<< "$hits"`（here-string），`while` 留在当前 shell，计数才准。
 已实测：有真问题时退出码 1，干净时 0。
 
+### 残留的旧图标：不在引用链上，但照样被编译
+
+报错形态（自检已经能定位到文件了）：
+
+```
+失败项：
+    - app/src/main/res/drawable/ic_boss.xml:8  用了 ?attr/colorControlNormal，但未声明
+    - 残留旧图标文件： drawable/ic_boss.xml
+```
+
+**这类文件最难查的地方**：Manifest 已经改成 `@mipmap/ic_launcher`，
+自检也报"icon 指向 @mipmap ✓"——**看引用关系一切正常**。
+但旧文件不在任何引用链上，**aapt 照样把它编译进 APK**，资源链接照样失败。
+从 Manifest 或引用链上永远发现不了它。
+
+**一键自愈**：
+
+```bash
+bash tools/check_android_toolchain.sh --fix
+```
+
+它会先删掉残留的旧图标文件，再跑完整检查（所以一轮就干净，不用跑两遍）。
+删完记得 `git add -A` 把删除提交进去。
+
+⚠️ **如果本地已经 PASS，但 CI 还报这个** —— 那是**推上去的仓库没同步**。
+这类"本地绿的、CI 红的"九成是旧文件没删掉或没提交删除。
+`git rm` 之后重新推，别指望"再跑一次"会变好。
+
 ### android-37 只有次要版本，必须写 `compileSdkMinor`
 
 CI 上终于装上了 android-37，但自检报：
