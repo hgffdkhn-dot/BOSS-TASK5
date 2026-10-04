@@ -158,15 +158,23 @@ class PatchRepository(private val app: Context) {
      * ——直接在主线程崩。挪到后台线程后由页面的 `catch (Throwable)` 接住，
      * 变成一条提示。
      */
-    private suspend fun <T> serial(block: () -> T): T = withContext(singleThread) {
-        lock.withLock {
-            if (!prepared) {
-                Veritpath.setTempDir(app.cacheDir.absolutePath)
-                prepared = true
+    /**
+     * ⚠️ block 必须是 `suspend () -> T`，不能写成 `() -> T`。
+     *    写成非挂起 lambda 的话，里面调用的 `run(...)` 是 suspend，
+     *    编译器会报 "Suspension functions can only be called within
+     *    coroutine body"——而且报错指向**调用处**（每一处 serial { }），
+     *    足足四行，看起来像四处都要改，实际上改这一处签名就行。
+     */
+    private suspend fun <T> serial(block: suspend () -> T): T =
+        withContext(singleThread) {
+            lock.withLock {
+                if (!prepared) {
+                    Veritpath.setTempDir(app.cacheDir.absolutePath)
+                    prepared = true
+                }
+                block()
             }
-            block()
         }
-    }
 
     /**
      * ⚠️ 输出有上限，超了会**静默截断**。

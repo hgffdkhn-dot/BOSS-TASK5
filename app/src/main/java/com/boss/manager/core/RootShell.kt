@@ -131,7 +131,10 @@ object RootShell {
             val r = runCatching {
                 BossIpc.exec(cmd, flags = BossIpc.Flag.NOLOG, timeoutMs = timeoutMs.toInt())
             }.getOrNull()
-            return r?.takeIf { it.ok() }?.output
+            // ⚠️ BossIpc.Result **没有** ok()——它的成员是 code / exitCode /
+            //    timedOut / output，成功与否要看 code == OK。
+            //    （RootShell.Result 才有 ok，别混。）
+            return r?.takeIf { it.code == BossIpc.Code.OK }?.output
         }
         return null
     }

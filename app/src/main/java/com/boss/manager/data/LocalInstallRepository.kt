@@ -88,7 +88,7 @@ class LocalInstallRepository(private val app: Context) {
      */
     suspend fun freeBytes(): Long? = withContext(Dispatchers.IO) {
         RootShell.exec("df -k /data/local/tmp", 8_000).output.lineSequence()
-            .drop(1).firstOrNull()?.split(Regex("\s+"))
+            .drop(1).firstOrNull()?.split(Regex("""\s+"""))
             ?.getOrNull(3)?.toLongOrNull()?.times(1024)
     }
 
@@ -148,7 +148,13 @@ class LocalInstallRepository(private val app: Context) {
         val sz = RootShell.exec("stat -c %s $work", 8_000).output.trim().toLongOrNull() ?: -1
         if (sz <= 0) return@withContext Step(false, "工作副本为空")
 
-        Step(true, "已读出 ${sz / 1048576}MB（备份：$backup）", backup, work, sz)
+        Step(
+            true,
+            "已读出 ${sz / 1048576}MB（备份：$backup）",
+            backup = backup,
+            workImg = work,
+            sizeBytes = sz,
+        )
     }
 
     // --------------------------------------------------------------- 修补
