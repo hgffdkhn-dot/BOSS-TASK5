@@ -2,6 +2,7 @@ package com.boss.manager.data
 
 import android.content.Context
 import android.net.Uri
+import com.boss.manager.core.RamdiskProbe
 import com.boss.manager.core.RootShell
 import dev.veritpath.Veritpath
 import kotlinx.coroutines.Dispatchers
@@ -59,18 +60,32 @@ class LocalInstallRepository(private val app: Context) {
      * Android 13+ GKI 多数在 init_boot；老机型/非 2SI 在 boot。
      * 两个都在时**优先 init_boot**——但如果它的 size 为 0 就退回 boot。
      */
+    /**
+     * 找出 ramdisk 所在的分区。
+     *
+     * ⚠️ 原来只查 `/dev/block/by-name`，**漏掉了 `/dev/block/platform/*/by-name`**。
+     *    而模拟器/虚拟机几乎都走后者（如 `platform/host/by-name/ramdisk`），
+     *    于是这些设备上本机安装页永远显示"未探测到分区"。
+     *
+     *    修法：**复用 RamdiskProbe.enumerateBlockDevices()**——
+     *    它已经处理了 1~2 层平台名不固定的问题，两边共用一套枚举，
+     *    免得一处修了另一处还是瞎的。
+     */
     suspend fun findPartition(): PartitionInfo? = withContext(Dispatchers.IO) {
         val slot = slotSuffix()
-        val list = RootShell.exec("ls /dev/block/by-name/", 8_000).output
-        val byName = list.lineSequence().map { it.trim() }.toSet()
+        val devices = RamdiskProbe.enumerateBlockDevices()
+        if (devices.isEmpty()) return@withContext null
 
-        for (name in listOf("init_boot", "boot")) {
-            val dev = "/dev/block/by-name/$name$slot"
-            // by-name 里没有就直接试路径（个别设备不建 symlink）
-            if (byName.isNotEmpty() && "$name$slot" !in byName) continue
+        // 名字优先：ramdisk > init_boot > boot > vendor_boot
+        for (want in listOf("ramdisk", "init_boot", "boot")) {
+            val name = want + slot
+            val dev = devices.firstOrNull { it.substringAfterLast('/') == name }
+                // 单槽设备没有 _a 后缀
+                ?: devices.firstOrNull { it.substringAfterLast('/') == want }
+                ?: continue
             val sz = partitionSize(dev) ?: continue
             if (sz <= 0) continue
-            return@withContext PartitionInfo(dev, name, slot, sz)
+            return@withContext PartitionInfo(dev, want, slot, sz)
         }
         null
     }

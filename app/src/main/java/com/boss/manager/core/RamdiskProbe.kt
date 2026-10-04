@@ -80,11 +80,8 @@ object RamdiskProbe {
         val hasRamdisk: Boolean get() = kind.hasRamdisk
     }
 
-    /**
-     * 候选位置。**先精确后宽泛**：
-     * 前面几个是各模拟器/管理器实际在用的路径，最后的目录是兜底扫描。
-     */
-    private val CANDIDATES = listOf(
+    /** 普通文件候选位置（块设备走下面的 by-name 枚举，不写死在这里）。 */
+    private val FILE_CANDIDATES = listOf(
         "/data/local/tmp/ramdisk.cpio",
         "/data/local/tmp/ramdisk.cpio.gz",
         "/data/local/tmp/ramdisk.img",
@@ -103,13 +100,88 @@ object RamdiskProbe {
     )
 
     /**
-     * 扫一遍候选位置，返回第一个**确实含 ramdisk** 的。
+     * by-name 目录的根。**中间那段平台名不固定**，所以只能给根、运行时枚举：
      *
-     * 不用"第一个存在的"——目录里可能有个空的 boot.img 占位文件，
+     *   /dev/block/by-name                      ← 少数设备直接建这层
+     *   /dev/block/platform/<soc>/by-name       ← 常见（如 .../platform/host/by-name）
+     *   /dev/block/platform/<soc>/<x>/by-name   ← 有些多一层
+     *
+     * ⚠️ 硬编码 "host" 是错的：那只是某一台虚拟机/模拟器上的名字，
+     *    真机上是 soc 厂商名（如 soc/1d84000.ufshc）。
+     */
+    private val BY_NAME_ROOTS = listOf(
+        "/dev/block/by-name",
+        "/dev/block/platform",
+    )
+
+    /** 块设备名的优先顺序：越像 ramdisk 的越靠前。 */
+    private val NAME_PRIORITY = listOf(
+        "ramdisk", "init_boot", "boot", "vendor_boot", "recovery",
+    )
+
+    /** 执行 shell 的抽象。**离机测试可注入假输出**，默认走 RootShell。 */
+    internal var shell: (String) -> String? = { RootShell.shSync(it) }
+
+    /**
+     * 枚举所有 by-name 目录下的块设备，按名字优先级排序。
+     *
+     * 返回形如 `/dev/block/platform/host/by-name/ramdisk` 的完整路径。
+     */
+    internal fun enumerateBlockDevices(): List<String> {
+        val dirs = mutableListOf<String>()
+        for (root in BY_NAME_ROOTS) {
+            if (root.endsWith("/by-name")) {
+                dirs += root
+                continue
+            }
+            // platform 下可能有 1~2 层
+            val lvl1 = shell("ls -1 $root")?.lineSequence()
+                ?.map { it.trim() }?.filter { it.isNotEmpty() } ?: continue
+            for (a in lvl1) {
+                val d1 = "$root/$a/by-name"
+                if (shell("test -d $d1 && echo yes")?.trim() == "yes") {
+                    dirs += d1
+                } else {
+                    // 再下一层
+                    val lvl2 = shell("ls -1 $root/$a")?.lineSequence()
+                        ?.map { it.trim() }?.filter { it.isNotEmpty() } ?: continue
+                    for (b in lvl2) {
+                        val d2 = "$root/$a/$b/by-name"
+                        if (shell("test -d $d2 && echo yes")?.trim() == "yes") dirs += d2
+                    }
+                }
+            }
+        }
+        val out = mutableListOf<String>()
+        for (d in dirs) {
+            val names = shell("ls -1 $d")?.lineSequence()
+                ?.map { it.trim() }?.filter { it.isNotEmpty() } ?: continue
+            out += names.map { "$d/$it" }
+        }
+        // 名字优先级：ramdisk > init_boot > boot > ...
+        return out.sortedWith(compareBy { p ->
+            val n = p.substringAfterLast('/')
+            NAME_PRIORITY.indexOfFirst { n == it || n.startsWith(it) }
+                .let { if (it < 0) NAME_PRIORITY.size else it }
+        })
+    }
+
+    /**
+     * 扫一遍，返回第一个**确实含 ramdisk** 的。
+     *
+     * 顺序：**块设备 by-name 优先**，普通文件兜底。
+     * 因为模拟器/虚拟机把 ramdisk 暴露成 `/dev/block/platform/*/by-name/*`
+     * 这种块设备节点，而真机刷机用的镜像反而常躺在 /sdcard 里。
+     *
+     * 不用"第一个存在的"——目录里可能有个空占位文件，
      * 那种应该继续找，而不是报"找到了"。
      */
     suspend fun find(): Found? = withContext(Dispatchers.IO) {
-        for (p in CANDIDATES) {
+        for (p in enumerateBlockDevices()) {
+            val f = classify(p)
+            if (f != null && f.kind.hasRamdisk) return@withContext f
+        }
+        for (p in FILE_CANDIDATES) {
             val f = classify(p)
             if (f != null && f.kind.hasRamdisk) return@withContext f
         }
@@ -118,16 +190,65 @@ object RamdiskProbe {
 
     /** 全扫一遍，返回所有含 ramdisk 的（供"让用户挑"用）。 */
     suspend fun findAll(): List<Found> = withContext(Dispatchers.IO) {
-        CANDIDATES.mapNotNull { classify(it) }.filter { it.kind.hasRamdisk }
+        (enumerateBlockDevices() + FILE_CANDIDATES)
+            .mapNotNull { classify(it) }
+            .filter { it.kind.hasRamdisk }
     }
 
-    /** 对单个文件做判定。不存在/读不到返回 null。 */
+    /** 把扫过的路径列出来——找不到时给用户看"我找过哪些地方"。 */
+    fun searchedPaths(): List<String> =
+        runCatching { enumerateBlockDevices() }.getOrDefault(emptyList()) + FILE_CANDIDATES
+
+    /** 对单个路径做判定（普通文件或块设备都行）。不存在/读不到返回 null。 */
     suspend fun classify(path: String): Found? = withContext(Dispatchers.IO) {
-        val size = sizeOf(path) ?: return@withContext null
-        if (size <= 0) return@withContext null
-        val head = readHead(path, 8) ?: return@withContext null
-        Found(path, kindOf(head, path), size)
+        /* ⚠️ 这里曾经有个致命 bug：`size <= 0` 就直接 return null。
+         *
+         *   而**块设备的 File.length() 一律返回 0**（实测 /dev/zero、/dev/null
+         *   都是 0 字节，它们根本不是常规文件）。于是 /dev/block/** 下面
+         *   每一个节点都被"大小为 0"这条判据无声跳过——
+         *
+         *   表现：明明 ramdisk 就在 /dev/block/platform/host/by-name/ramdisk，
+         *         App 却报"否"。这就是为什么必须专门修它。
+         *
+         *   修法：块设备改走 blockdev --getsize64 / /sys/class/block/<n>/size，
+         *        并且**块设备不做 <=0 过滤**（读不到大小也要继续读头判定）。 */
+        val isBlock = isBlockDevice(path)
+        val size = if (isBlock) blockSize(path) else fileSize(path)
+        val head = readHead(path, 8, isBlock) ?: return@withContext null
+        val kind = kindOf(head, path, isBlock)
+        if (!isBlock && (size == null || size <= 0L)) {
+            // 普通文件为 0 字节确实是空的——那种才是真的没有
+            if (size != null && size <= 0L) return@withContext null
+        }
+        Found(path, kind, size ?: 0L)
     }
+
+    /** 块设备判断：/dev/block/ 下的都算，另外非常规文件也算。 */
+    private fun isBlockDevice(path: String): Boolean {
+        if (path.startsWith("/dev/block/")) return true
+        return runCatching {
+            val f = java.io.File(path)
+            f.exists() && !f.isFile && !f.isDirectory
+        }.getOrDefault(false)
+    }
+
+    /**
+     * 块设备大小。
+     * `blockdev` 不是每台都有，所以退回 /sys/class/block/<name>/size（512 字节扇区数）。
+     */
+    private fun blockSize(dev: String): Long? {
+        val r = shell("blockdev --getsize64 $dev")
+        val v = r?.trim()?.toLongOrNull()
+        if (v != null && v > 0) return v
+        val name = dev.substringAfterLast('/')
+        val s = shell("cat /sys/class/block/$name/size")?.trim()?.toLongOrNull()
+        return s?.times(512)
+    }
+
+    private fun fileSize(path: String): Long? = runCatching {
+        val f = java.io.File(path)
+        if (f.canRead()) f.length() else shell("stat -c %s '$path'")?.trim()?.toLongOrNull()
+    }.getOrNull()
 
     // ------------------------------------------------------------ magic 判定
 
@@ -135,7 +256,7 @@ object RamdiskProbe {
      * @param head 至少 8 字节
      * @param path 仅用于 gzip 时解压确认，失败就退回 GZIP_CPIO 的"不确定"态
      */
-    private fun kindOf(head: ByteArray, path: String): Kind {
+    private fun kindOf(head: ByteArray, path: String, isBlock: Boolean = false): Kind {
         fun eq(off: Int, s: String) =
             head.size >= off + s.length && String(head, off, s.length, Charsets.US_ASCII) == s
         fun hx(off: Int, len: Int) =
@@ -148,7 +269,7 @@ object RamdiskProbe {
 
         if (hx(0, 2) == "1f8b") {
             // gzip：解压后看头 6 字节是不是 cpio newc
-            return if (gzipHeadIsCpio(path)) Kind.GZIP_CPIO else Kind.UNKNOWN
+            return if (gzipHeadIsCpio(path, isBlock)) Kind.GZIP_CPIO else Kind.UNKNOWN
         }
         if (hx(0, 4) == "04224d18" || hx(0, 4) == "02214c18") return Kind.LZ4_CPIO
         if (hx(0, 6) == "fd377a585a00") return Kind.XZ_CPIO
@@ -156,43 +277,39 @@ object RamdiskProbe {
         return Kind.UNKNOWN
     }
 
-    /** 解压前几字节确认是不是 cpio。失败按"不确定"处理，不硬说它是。 */
-    private fun gzipHeadIsCpio(path: String): Boolean = runCatching {
-        val src = if (File(path).canRead()) File(path).inputStream()
-        else RootShell.openRead(path) ?: return false
-        src.use { raw ->
-            java.util.zip.GZIPInputStream(raw).use { gz ->
-                val b = ByteArray(6)
-                val n = gz.read(b)
-                n == 6 && (String(b, Charsets.US_ASCII) == "070701" ||
-                        String(b, Charsets.US_ASCII) == "070702")
+    /**
+     * 解压前几字节确认是不是 cpio。失败按"不确定"处理，不硬说它是。
+     *
+     * ⚠️ 块设备**不能**走 FileInputStream（没权限，且不是常规文件），
+     *    得用 shell 管道：`dd | gzip -dc | head -c 6 | od`。
+     *    gzip 流只给前 8 字节解压不出 6 个字节，所以取 512 字节——
+     *    足够 inflate 出开头，又不至于把整个分区读出来。
+     */
+    private fun gzipHeadIsCpio(path: String, isBlock: Boolean): Boolean {
+        val want = { b: ByteArray ->
+            b.size >= 6 && String(b, 0, 6, Charsets.US_ASCII).let {
+                it == "070701" || it == "070702"
             }
         }
-    }.getOrDefault(false)
+        if (!isBlock) {
+            runCatching {
+                val f = java.io.File(path)
+                if (f.canRead()) {
+                    java.util.zip.GZIPInputStream(f.inputStream()).use { gz ->
+                        val b = ByteArray(6)
+                        if (gz.read(b) == 6 && want(b)) return true
+                    }
+                }
+            }
+        }
+        val hex = shell(
+            "dd if='$path' bs=1 count=512 2>/dev/null | gzip -dc 2>/dev/null | " +
+                "head -c 6 | od -An -tx1"
+        ) ?: return false
+        val b = hexToBytes(hex)
+        return want(b)
+    }
 
     // ------------------------------------------------------------ 读文件
 
-    private fun sizeOf(path: String): Long? = runCatching {
-        val f = File(path)
-        if (f.canRead()) f.length()
-        else RootShell.sizeOfSync(path)
-    }.getOrNull()
-
-    /** 读前 n 字节。App 读得到就直接读，否则走 root。 */
-    private fun readHead(path: String, n: Int): ByteArray? = runCatching {
-        val f = File(path)
-        if (f.canRead()) {
-            f.inputStream().use { it.readNBytes(n) }
-        } else {
-            val hex = RootShell.headHexSync(path, n) ?: return null
-            hexToBytes(hex)
-        }
-    }.getOrNull()
-
-    private fun hexToBytes(hex: String): ByteArray {
-        val clean = hex.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
-        val out = ByteArray(clean.length / 2)
-        for (i in out.indices) out[i] = clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-        return out
-    }
 }

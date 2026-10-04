@@ -93,7 +93,82 @@ App 对 `/data/local/tmp` 这类路径通常没有读权限，所以：
 **装了 BOSS 的机器上 `cachedSu` 是 null**（那条路从没走过），
 结果"装了 BOSS 反而读不到文件头"。改成两条通道都试。
 
-## 6. 验证状态
+## 6. 补充：为什么在虚拟机上"找不到"（真因不是路径没列全）
+
+用户报：ramdisk 就在 `/dev/block/platform/host/by-name/`，App 却显示"否"。
+
+**真因是一个致命的 size 判据，不是候选路径缺失：**
+
+```kotlin
+val size = sizeOf(path) ?: return null
+if (size <= 0) return@withContext null     // ← 块设备被这里全灭
+```
+
+**块设备的 `File.length()` 一律返回 0：**
+
+```
+/dev/zero     isFile=false   size=0
+/dev/null     isFile=false   size=0
+/dev/urandom  isFile=false   size=0
+```
+
+`/dev/block/**` 下全是块设备节点，size 一律 0 → **全部被无声跳过**。
+就算路径列对了，也永远显示"否"。
+
+### 修法
+
+| 问题 | 修法 |
+|---|---|
+| 块设备 size 恒为 0 | 块设备走 `blockdev --getsize64` / `/sys/class/block/<n>/size×512`，**且不做 <=0 过滤** |
+| 候选只有普通文件 | 新增 by-name 块设备枚举 |
+| 平台名写死 | **不写死**，运行时枚举 1~2 层 |
+
+`File` 空文件仍按 0 过滤——那个语义是对的，只对块设备放开。
+
+### by-name 目录是**两级不固定**的，不能硬编码 `host`
+
+```
+/dev/block/by-name                      ← 少数设备
+/dev/block/platform/<soc>/by-name       ← 常见（host 只是某一台上的名字）
+/dev/block/platform/<soc>/<x>/by-name   ← 有些多一层
+```
+
+真机上是 soc 厂商名（如 `soc/1d84000.ufshc`），写死 `host` 在真机上必然失效。
+
+实测三种布局（假 shell 注入）：
+
+```
+虚拟机(host/ramdisk)  枚举到 3 个: ['ramdisk','boot','vendor_boot']
+                      首个(优先) = /dev/block/platform/host/by-name/ramdisk
+两层soc               枚举到 2 个: ['init_boot','boot']
+直连by-name           枚举到 1 个: ['ramdisk']
+```
+
+名称优先级 `ramdisk > init_boot > boot > vendor_boot > recovery` 生效。
+
+### 顺带修：本机安装页有**同一个盲区**
+
+`LocalInstallRepository.findPartition()` 原来也只查 `/dev/block/by-name`，
+在虚拟机上永远"未探测到分区"。已改为**复用 `RamdiskProbe.enumerateBlockDevices()`**
+——两边共用一套枚举，免得一处修了另一处还是瞎的。
+
+### gzip 块设备分支
+
+块设备没有 `FileInputStream`，gzip 解压确认改走 shell 管道：
+
+```
+dd if=<dev> bs=1 count=512 | gzip -dc | head -c 6 | od -An -tx1
+```
+
+取 512 字节（只给 8 字节 inflate 不出 6 个字节；又不至于读整个分区）。
+实测：`gzip(cpio)` → GZIP_CPIO；`gzip(非cpio)` → **UNKNOWN（不误报）**。
+
+### 找不到时把扫过的地方列出来
+
+否则用户只能报"显示否"，而"扫过哪些"才是定位的关键信息。
+主界面现在会列出扫描过的路径（节选 4 条）。
+
+## 7. 验证状态
 
 | 项 | 状态 |
 |---|---|
@@ -101,6 +176,9 @@ App 对 `/data/local/tmp` 这类路径通常没有读权限，所以：
 | veritpath 真实产物复核 | ✅ `init_boot.img`→BOOT、`ramdisk.cpio`→RAW_CPIO |
 | Kotlin 静态检查（import、括号） | ✅ 通过 |
 | C 侧回归 | ✅ 全绿 |
+| 枚举逻辑（3 种 by-name 布局） | ✅ 假 shell 注入实测 |
+| 块设备 size=0 分支（旧逻辑 vs 新逻辑） | ✅ 复刻验证 |
+| gzip 块设备解压确认（含非 cpio 反例） | ✅ 实测 |
 | **真机 / 模拟器上探测** | ❌ **未验** |
 | **Gradle 编译** | ❌ 未验（沙盒无 SDK） |
 

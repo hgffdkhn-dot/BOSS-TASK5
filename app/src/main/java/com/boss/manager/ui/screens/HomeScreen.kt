@@ -4,12 +4,14 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.boss.manager.data.BossStatus
 import com.boss.manager.data.VerifyReport
 import com.boss.manager.ui.BossViewModel
+import com.boss.manager.core.RamdiskProbe
 import com.boss.manager.ui.KV
 import com.boss.manager.ui.SectionCard
 
@@ -70,7 +72,31 @@ fun HomeScreen(vm: BossViewModel, status: BossStatus?) {
                 )
                 rd?.let {
                     KV("  └ 位置", it.path)
-                    KV("  └ 大小", "${it.sizeBytes / 1024} KB")
+                    KV(
+                        "  └ 大小",
+                        if (it.sizeBytes > 0) "${it.sizeBytes / 1024} KB"
+                        else "读不到大小（块设备常见，不影响判定）",
+                    )
+                } ?: run {
+                    // 找不到时把扫过的地方列出来。
+                    // 不然用户只能报"显示否"，而"扫过哪些"才是定位的关键信息。
+                    val tried = runCatching { RamdiskProbe.searchedPaths() }.getOrNull()
+                    if (!tried.isNullOrEmpty()) {
+                        Text(
+                            "扫过 ${tried.size} 个位置（节选）：",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        tried.take(4).forEach {
+                            Text(
+                                "  · $it",
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace
+                                ),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                 }
             }
         }

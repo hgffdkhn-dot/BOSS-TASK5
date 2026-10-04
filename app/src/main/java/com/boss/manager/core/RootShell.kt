@@ -121,7 +121,8 @@ object RootShell {
      *    （那条路从没走过），但 daemon 通道完全可用。
      *    只认 su 会让"装了 BOSS 的机器反而读不到文件头"。
      */
-    private fun shSync(cmd: String, timeoutMs: Long = 10_000): String? {
+    /** public：RamdiskProbe 枚举块设备目录要用（它自己不好开协程执行）。 */
+    fun shSync(cmd: String, timeoutMs: Long = 10_000): String? {
         val su = cachedSu
         if (su != null) {
             val r = rawExecSync(listOf(su, "-c", cmd), timeoutMs)
