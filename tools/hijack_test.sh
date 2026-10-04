@@ -82,11 +82,65 @@ check "跳过时返回 0（不拖住 init）" "$RC" "0"
 echo "$OUT" | grep -q "跳过" && ok "说清了跳过原因" || bad "没说明原因: $OUT"
 
 echo
+echo "== 3c. /sdcard 陷阱：本轮修复的核心 =="
+# 旧实现会把 /sdcard 造出来（普通文件）再 bind 上去：
+#   · mount 在普通文件上是合法的 → 返回 0 → mounted=1（假成功）
+#   · 于是退路 1 与 hexpatch 被跳过，还不打失败日志 → 劫持静默失效
+#   · 更糟：init 稍后的 `symlink /storage/self/primary /sdcard` 会 EEXIST 失败，
+#     用户的内部存储直接没了。
+# 所以：任何 hijack-prep 跑完，都不应出现 /sdcard，也不应留下 /storage/self。
+BEFORE_SDCARD=0; BEFORE_SELF=0
+[ -e /sdcard ] && BEFORE_SDCARD=1
+[ -e /storage/self/primary ] && BEFORE_SELF=1
+BOSS_LAYOUT=2si $KIT hijack-prep >/dev/null 2>&1
+BOSS_LAYOUT=2si $KIT hijack-prep --dry >/dev/null 2>&1
+AFTER_SDCARD=0; AFTER_SELF=0
+[ -e /sdcard ] && AFTER_SDCARD=1
+[ -e /storage/self/primary ] && AFTER_SELF=1
+if [ "$BEFORE_SDCARD" != "$AFTER_SDCARD" ]; then
+    bad "hijack-prep 造出了 /sdcard（会挡住 init 稍后的 symlink，用户存储丢失）"
+else
+    ok "未创建 /sdcard"
+fi
+if [ "$BEFORE_SELF" != "$AFTER_SELF" ]; then
+    bad "hijack-prep 留下了 /storage/self/primary（同样是 init 的地盘）"
+else
+    ok "未占用 /storage/self/primary"
+fi
+
+echo
+echo "== 3d. 目标不存在时必须说"时机未到"，不能谎报成功 =="
+OUT=$(BOSS_LAYOUT=2si $KIT hijack-prep 2>&1)
+echo "$OUT" | grep -q "尚未就绪" && ok "报了时机未到" || bad "没报时机未到: $OUT"
+echo "$OUT" | grep -qE "已挂载并验收|成功的" && bad "目标不存在却谎报成功" || ok "未谎报成功"
+
+echo
+echo "== 3e. 挂载必须验收（mount 返回 0 ≠ 挂对了地方）=="
+FAKET="$TEST_DIR/fakeinit"
+cp /bin/sh "$FAKET" 2>/dev/null
+# 中间输出一律写 TEST_DIR：/tmp 下的固定文件名是全局的，
+# root 跑过一次之后 nobody 就 Permission denied（这已经是第三次踩到了）
+H1="$TEST_DIR/hij1.out"; H2="$TEST_DIR/hij2.out"
+if [ "$UID_NOW" -eq 0 ]; then
+    BOSS_LAYOUT=2si BOSS_HIJACK_TARGET="$FAKET" $KIT hijack-prep > "$H1" 2>&1
+    grep -q "已挂载并验收" "$H1" && ok "挂载后完成验收" || bad "未验收: $(cat "$H1")"
+    # 幂等：再跑一次不能重复挂
+    BOSS_LAYOUT=2si BOSS_HIJACK_TARGET="$FAKET" $KIT hijack-prep > "$H2" 2>&1
+    grep -q "幂等跳过" "$H2" && ok "重复执行幂等" || bad "不幂等: $(cat "$H2")"
+    umount "$FAKET" 2>/dev/null
+else
+    # 非 root：mount 必然失败，此时**绝不能**报成功
+    BOSS_LAYOUT=2si BOSS_HIJACK_TARGET="$FAKET" $KIT hijack-prep > "$H1" 2>&1
+    grep -qE "已挂载并验收" "$H1" \
+        && bad "非 root 下 mount 失败却报了成功" || ok "失败时不谎报成功"
+fi
+
+echo
 echo "== 4. 布置失败不能中断 init（这条决定开不开得了机）=="
 if [ "$UID_NOW" -eq 0 ]; then
-    # 真跑会真的 bind mount /sdcard。在开发者本机上做这件事既危险又没意义，
-    # 而 root 环境下 mount 会成功，也验不到"失败"这条分支。
-    skip "root 环境：真跑会真的挂载 /sdcard，只在非特权环境（CI）验"
+    # root 下 mount 会成功，验不到"全部路径都失败"这条分支；
+    # 而非特权环境（CI）里 mount 必失败，正好验它。
+    skip "root 环境：mount 会成功，验不到失败分支（CI 的非特权环境会验）"
 else
     timeout 20 $KIT hijack-prep >/dev/null 2>&1; RC=$?
     check "mount 失败仍返回 0（init 不会被拖住）" "$RC" "0"

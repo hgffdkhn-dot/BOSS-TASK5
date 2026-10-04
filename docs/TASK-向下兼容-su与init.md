@@ -36,6 +36,8 @@
 | 布局探测 | 新增 `boss init probe`，输出 LAYOUT / HIJACK_NEEDED / RAMDISK_RC_EFFECTIVE | `src/bossinit.c` |
 | 按布局自适应 | 非 2SI 布局直接跳过劫持（老设备上劫持会遮住 `/sdcard`） | `src/bossinit.c` |
 | 现场覆盖开关 | `boss_hijack=0/1`（cmdline，真机自救）+ `BOSS_LAYOUT=`（离机测试） | `src/bossinit.c` |
+| 劫持落点重做 | 不再碰 `/sdcard`；改挂"切根后成为 `/system/bin/init`"的真实路径，且挂载后按 mountinfo 验收 | `src/bossinit.c` |
+| 劫持重试时机 | rc 触发点 `early-init` → `early-init` / `fs` / `post-fs`，幂等 | `payload/init.boss.rc` |
 | rc 语法降到老 init | 全程 `start` + `service`，不用 `exec_background`、不写 `seclabel`，服务名 ≤16 | `payload/init.boss.rc` |
 | payload 下限 | `min_api` 26 → 23 | `payload/manifest.json` |
 | 验收 | 新增 `tools/compat_test.sh`（28 项），CI 加 `compat` job | `tools/` `.github/` |
@@ -164,7 +166,50 @@ manager_flow 全过、IPC 10 项全过。
 
 ---
 
-## 6. 本轮修掉的一个真 bug（栈越界写）
+## 6. 本轮修掉的第二个真 bug：劫持的"假成功"（外部开发者指出）
+
+上一版 `hijack-prep` 把 bossinit bind 到 `/sdcard`。开发者指出：`/sdcard` 是 init
+在 post-fs 前后才建的 symlink，**early-init 时不存在**。实际执行序列是：
+
+```
+access("/sdcard") != 0  →  open("/sdcard", O_CREAT)  →  造出一个普通文件
+mount(self, "/sdcard")  →  挂到普通文件上是合法的  →  返回 0  →  mounted=1
+```
+
+后果比"没生效"更糟，一共三层：
+
+1. bossinit 落在 `/sdcard` 这个空文件上，切根后它在 `/system/sdcard`——
+   **不是** `/system/bin/init`，劫持根本没发生；
+2. `mounted=1` 让退路 1（`/storage/self/primary`，那条才是对的）与
+   退路 ③（hexpatch）全部被跳过，**且不打任何失败日志**；
+3. `/sdcard` 被占成一个普通文件后，init 稍后那句
+   `symlink /storage/self/primary /sdcard` 会因 EEXIST 失败——
+   **用户的内部存储直接没了**。
+
+本机已复现确认：跑完 `/sdcard` 变成一个 160KB 的普通文件。
+
+**修法三条**：
+
+| # | 做法 | 为什么 |
+|---|---|---|
+| 1 | 不再碰 `/sdcard`，也不再铺 `/storage/self/primary` | 两个都是 init 稍后自己要建的路径，提前占住就是 EEXIST 冲突 |
+| 2 | 挂载点必须是**已存在的普通文件** | `/system` 在第一阶段早期还没挂载，那时挂必然 ENOENT——这是"时机未到"，要留给后续 trigger 重试，不能当失败，更不能谎报成功 |
+| 3 | 挂载后**验收**：扫 `/proc/self/mountinfo` 确认目标路径上真多了一条挂载 | `mount()` 返回 0 只说明"挂上了"，不说明"挂对了地方" |
+
+同时把 rc 里的触发点从 `early-init` 一处扩到 **`early-init` / `fs` / `post-fs`
+三处**：劫持落点位于 `/system` 上，早期 `/system` 没挂载，真正生效的往往是更晚
+的那一趟。hijack-prep 自身幂等（已挂载就跳过），多跑几次没有副作用。
+
+### 顺带挖出的第三个 bug：`realpath` 会 abort
+
+改用 `realpath()` 解析目标路径时，最初给了 512 字节缓冲区，结果运行直接
+`*** buffer overflow detected ***` 然后 abort。glibc 在开了 `_FORTIFY_SOURCE`
+时会检查目的缓冲区，realpath 需要 **PATH_MAX** 大小。
+
+**这个 abort 若发生在第一阶段 init 里就是开机直接挂**，比劫持失败严重得多。
+现已统一按 `PATH_MAX` 开辟，并在 `target_probe()` 里对"调用方给小了"直接拒绝。
+
+## 7. 本轮修掉的一个真 bug（栈越界写）
 
 为了兼容老应用 `su -c ls -l`（命令不带引号）的写法， su 要把 `-c` 之后的所有
 token 拼成一条命令。第一版是这么写的：
@@ -193,7 +238,12 @@ i=4  进入时 off=1809  room=18446744073709550831     <- 下溢
 顺带一提：ASAN/UBSAN **没能**捕获这个越界（栈数组插桩没覆盖到"写入起点直接跳过
 redzone"这种情况），所以别把"ASAN 没报"当成"没有内存问题"。
 
-## 7. 边界：这一轮**没有**覆盖什么
+> ⚠️ 测试脚本里的中间输出一律写 `$TEST_DIR`，不要放 `/tmp/xxx` 这类全局
+> 固定路径。root 跑过一次之后，非 root 会 Permission denied，症状是
+> "命令没输出 → 判定失败"，看着像功能坏了，其实是权限。本轮踩到三次
+> （`/tmp/boss-props`、`/tmp/boss-test.prop`、`/tmp/boss-hij.out`），已全部收敛。
+
+## 8. 边界：这一轮**没有**覆盖什么
 
 | 事项 | 状态 | 说明 |
 |---|---|---|

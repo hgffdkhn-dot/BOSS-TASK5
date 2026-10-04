@@ -37,14 +37,23 @@
 
 # 执行链第一环：hijack-prep 必须在**切根之前**跑。
 #
-# 为什么挂在 early-init：2SI 设备的第一阶段 init 解析的就是 ramdisk 里的
-# /init.rc（本文件被 veritpath import 进它），而 early-init 是它最早的
-# trigger——正好在 SwitchRoot 之前。挂在 post-fs-data 就太晚了：那时 ramdisk
-# 已经在切根中消失，本文件都不存在了。
+# 为什么挂三个 trigger（early-init / fs / post-fs）：
+#   劫持的落点是"切根后会变成 /system/bin/init"的那个文件，而它位于 /system
+#   上——第一阶段早期 /system **还没挂载**，那时挂载必然 ENOENT。
+#   所以 early-init 这一趟多半只能"啥也做不了"，真正生效的往往是更晚的那一趟。
+#   三个 trigger 都在切根之前，hijack-prep 自身幂等（已挂载就跳过），
+#   多跑几次没有副作用；挂在 post-fs-data 就太晚了：那时 ramdisk 已经
+#   在切根中消失，本文件都不存在了。
 #
 # 非 2SI 设备上 boss init probe 会判定为 legacy_root，此时 hijack-prep
-# 自己会跳过（老设备不需要劫持，bind 到 /sdcard 反而会遮住内部存储）。
+# 自己会跳过（老设备不需要劫持，动了只会遮住用户的 /sdcard）。
 on early-init
+    start boss_early
+
+on fs
+    start boss_early
+
+on post-fs
     start boss_early
 
 on post-fs-data

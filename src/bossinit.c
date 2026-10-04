@@ -429,6 +429,58 @@ static enum boss_layout detect_layout(void)
     return LAYOUT_LEGACY_ROOT;
 }
 
+/* ---- 劫持落点候选 ----
+ * 切根后要落到 /system/bin/init，对应的旧根路径首选 /system/system/bin/init
+ * （SAR 布局：system 分区里再套一层 system/，切根后正好映射过去）；
+ * 另一种布局退到 /system/bin/init。两个都试，靠 mountinfo 验收。 */
+static const char *const hijack_targets[] = {
+    "/system/system/bin/init",
+    "/system/bin/init",
+    NULL
+};
+
+/* 测试开关（与 BOSS_INIT_REAL / BOSS_LAYOUT 同一套路）：真机上 init 传下来的
+ * 环境是空的，不可能被意外带上。有了它，"挂载成功"这条路径才能在沙盒里回归。 */
+static const char *hijack_override(void)
+{
+    const char *ov = getenv("BOSS_HIJACK_TARGET");
+    return (ov && *ov) ? ov : NULL;
+}
+
+/* 目标能不能挂：1=可用（real 写回真实路径） 0=不存在（时机未到） -1=不是普通文件
+ *
+ * ⚠️ real 必须是 **PATH_MAX** 大小。glibc 的 realpath 在开了 _FORTIFY 时
+ * 会检查目的缓冲区：给 512 字节就直接 `*** buffer overflow detected ***` 然后
+ * abort()（本机实测复现）。这个 abort 若发生在第一阶段 init 里就是开机直接挂，
+ * 所以这里统一按 PATH_MAX 开辟，别图省事写小。 */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+static int target_probe(const char *p, char *real, size_t realsz)
+{
+    struct stat st;
+    if (stat(p, &st) != 0) return 0;
+    if (!S_ISREG(st.st_mode)) return -1;
+    if (realsz < PATH_MAX) return -1;              /* 调用方给小了：宁可不用 */
+    if (!realpath(p, real)) boss_copy(real, realsz, p);
+    return 1;
+}
+
+/* 验收：目标路径上是不是真有一条挂载。
+ * 这一条是整个修复的核心 —— mount() 返回 0 说明不了挂对了地方。 */
+static int mount_at_is(const char *tgt)
+{
+    struct boss_mount **ms = NULL;
+    int n = boss_mount_scan(&ms);
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        if (ms[i] && !strcmp(ms[i]->tgt, tgt)) { found = 1; break; }
+    }
+    for (int i = 0; i < n; i++) free(ms[i]);
+    free(ms);
+    return found;
+}
+
 /* boss init probe：把判定结果打出来。
  * 真机第一件事应该是跑它——先确认自己在哪种布局上，再谈改代码。 */
 static int cmd_probe(void)
@@ -453,10 +505,11 @@ static int cmd_hijack_prep(int argc, char **argv)
     int dry = 0;
     for (int i = 0; i < argc; i++) if (!strcmp(argv[i], "--dry")) dry = 1;
     int mounted = 0;
+    int notready_all = 0;   /* 时机未到：不算失败，也不该去走 hexpatch */
 
     /* ---- 向下兼容：非 2SI 设备直接跳过 ----
      * 老布局（ramdisk 就是 /）上 ramdisk 里的 rc 全程有效，根本不需要劫持；
-     * 而劫持在这里的副作用（bind 到 /sdcard）会盖住用户的内部存储。
+     * 而劫持在这里只会带来副作用（把 bossinit 挂到某个路径上）。
      * 所以判定为 legacy_root 时明确跳过，并留下 kmsg 说明原因。 */
     if (detect_layout() != LAYOUT_TWO_STAGE) {
         printf("hijack-prep: 非 2SI 布局，跳过（ramdisk 里的 rc 全程有效，无需劫持）\n");
@@ -464,16 +517,9 @@ static int cmd_hijack_prep(int argc, char **argv)
         return 0;
     }
 
-    /* dry run 下连符号链接都不铺：它本来的意义就是"看一眼打算做什么"，
-     * 铺了就会在测试机上留下垃圾，反而让人分不清是 dry 留下的还是真跑的。 */
-    if (dry) {
-        printf("hijack-prep: would mkdir /storage/self\n");
-        printf("hijack-prep: would symlink /storage/self/primary -> /system/system/bin/init\n");
-    } else {
-        (void)boss_mkdirs("/storage/self", 0755);
-        (void)unlink("/storage/self/primary");
-        if (symlink("/system/system/bin/init", "/storage/self/primary") != 0) { /* 已存在 */ }
-    }
+    /* 不铺任何 symlink：/storage/self/primary 与 /sdcard 都是 init 在
+     * post-fs 前后**自己要建**的路径。我们提前占住，init 那句 symlink 就会
+     * 因 EEXIST 失败——用户的内部存储直接没了。这比劫持失败糟得多。 */
 
     /* 自身路径：真机上就是 ramdisk 里的 /boss（veritpath 放进去的那一份） */
     char self[256] = { 0 };
@@ -515,35 +561,79 @@ static int cmd_hijack_prep(int argc, char **argv)
         else (void)mount("/init", "/init.real", NULL, MS_BIND, NULL);
     }
 
-    /* ---- ② 主路径：把 bossinit bind 到 /sdcard ----
-     * 直接调 mount(2)：第一阶段没有 toolbox，fork /system/bin/mount 必然 127。 */
-    if (access("/sdcard", F_OK) != 0) {
-        int fd = open("/sdcard", O_CREAT | O_RDONLY | O_CLOEXEC, 0700);
-        if (fd >= 0) close(fd);
-    }
-    if (dry) {
-        printf("hijack-prep: would bind %s -> /sdcard\n", self);
-        printf("hijack-prep: （dry run：不做任何 mount）\n");
-        return 0;
-    }
-    if (mount(self, "/sdcard", NULL, MS_BIND, NULL) == 0) {
-        mounted = 1;
-        kmsg_log("boss: hijack-prep bind %s -> /sdcard 成功\n", self);
-    } else {
-        /* 退路 1：/sdcard 在部分机型上已是一个真实目录（魅族等"用 2SI 但
-         * 不切根"的机器），此时挂载点不同，改挂符号链接本身。 */
-        if (mount(self, "/storage/self/primary", NULL, MS_BIND, NULL) == 0) {
-            mounted = 1;
-            kmsg_log("boss: hijack-prep bind -> /storage/self/primary 成功\n");
-        } else {
-            /* 退路 2：三星 RKP 等不允许新增挂载时，从 rootfs 自挂（/sdcard → /sdcard） */
-            if (mount("/sdcard", "/sdcard", NULL, MS_BIND, NULL) == 0) {
-                mounted = 1;
-                kmsg_log("boss: hijack-prep 自挂 /sdcard 成功（RKP 型设备）\n");
-            } else {
-                kmsg_log("boss: hijack-prep bind 失败: %s\n", strerror(errno));
-            }
+    /* ---- ② 主路径：bind 到"切根后会成为 /system/bin/init"的那个路径 ----
+     * 直接调 mount(2)：第一阶段没有 toolbox，fork /system/bin/mount 必然 127。
+     *
+     * ⚠️ 上一版在这里栽了个很隐蔽的坑（外部开发者指出，已复现确认）：
+     *   · /sdcard 是 init 在 post-fs 前后才建的 symlink，early-init 时不存在；
+     *   · 代码用 open(O_CREAT) 把它造出来 → 一个**普通文件**；
+     *   · mount(self, "/sdcard") 挂到普通文件上是**合法**的，返回 0；
+     *   · 于是 mounted=1：退路 1（/storage/self/primary，那条才是对的）和
+     *     退路 ③（hexpatch）都被跳过，还不打失败日志 —— 劫持静默失效。
+     *   更糟的是：/sdcard 一旦是个普通文件，init 稍后那句
+     *   `symlink /storage/self/primary /sdcard` 会 EEXIST 失败，
+     *   用户的内部存储直接没了。
+     *
+     * 修法三条：
+     *   1) 不再碰 /sdcard，也不再铺 /storage/self/primary（同样是 init 的地盘）。
+     *   2) 挂载点必须是**已经存在的普通文件**。/system 在第一阶段早期还没挂载，
+     *      那时挂必然 ENOENT —— 这不算失败，是"时机未到"，留给后续 trigger 重试。
+     *   3) 挂载后**验收**：扫 /proc/self/mountinfo 确认目标路径上真多了一条挂载。
+     *      mount() 返回 0 只说明"挂上了"，不说明"挂对了地方"。
+     */
+    {
+        const char *cands[4];
+        int nc = 0;
+        if (hijack_override()) cands[nc++] = hijack_override();
+        for (int i = 0; hijack_targets[i] && nc < 4; i++)
+            cands[nc++] = hijack_targets[i];
+
+        /* dry run：把打算挂哪说清楚（不检查是否存在，因为 dry 的意义就是
+         * "看一眼计划"，此时 /system 往往还没挂） */
+        if (dry) {
+            printf("hijack-prep: would bind %s -> %s\n", self, cands[0]);
+            printf("hijack-prep: （dry run：不做任何 mount）\n");
+            return 0;
         }
+
+        int tried = 0, notready = 0;
+        for (int i = 0; i < nc; i++) {
+            char real[PATH_MAX];
+            int r = target_probe(cands[i], real, sizeof(real));
+            if (r == 0) {
+                notready = 1;
+                kmsg_log("boss: 劫持目标 %s 尚不存在（/system 还没挂载）\n", cands[i]);
+                continue;
+            }
+            if (r < 0) {
+                kmsg_log("boss: 劫持目标 %s 不是普通文件，跳过\n", cands[i]);
+                continue;
+            }
+            tried = 1;
+
+            /* 幂等：已经挂上了就别再挂一次 */
+            if (mount_at_is(real)) {
+                mounted = 1;
+                printf("hijack-prep: %s 已在挂载状态（幂等跳过）\n", real);
+                kmsg_log("boss: 劫持目标 %s 已在挂载状态（幂等跳过）\n", real);
+                break;
+            }
+            if (mount(self, real, NULL, MS_BIND, NULL) == 0 && mount_at_is(real)) {
+                mounted = 1;
+                printf("hijack-prep: 已挂载并验收 %s\n", real);
+                kmsg_log("boss: hijack-prep bind %s -> %s 成功（已验收）\n", self, real);
+                break;
+            }
+            /* 这里必须记失败：mount 返回 0 但没验收通过，也是失败 */
+            printf("hijack-prep: 挂载失败或未生效: %s (%s)\n", real, strerror(errno));
+            kmsg_log("boss: hijack-prep bind %s 失败或未生效: %s\n", real, strerror(errno));
+        }
+
+        if (notready) {
+            printf("hijack-prep: 目标尚未就绪（/system 还没挂载），本轮不动作\n");
+            kmsg_log("boss: hijack-prep 时机未到，等后续 trigger 重试\n");
+        }
+        if (!tried && notready) notready_all = 1;
     }
 
     /* ---- ③ 退化路径：rootfs 可写时 hexpatch /init ----
@@ -556,14 +646,14 @@ static int cmd_hijack_prep(int argc, char **argv)
      *     注定失败。它本来就是 Magisk 在**离线 patch boot 镜像**时用的手段，
      *     运行时基本做不到——留着是为了覆盖那些确实可写的老内核。
      */
-    if (!mounted && !dry) {
+    if (!mounted && !dry && !notready_all) {
         if (copy_self_to(BOSS_HEXPATCH_PATH) == 0 && hexpatch_init() == 0) {
             mounted = 1;
             kmsg_log("boss: hijack-prep hexpatch /init -> %s 成功\n", BOSS_HEXPATCH_PATH);
         }
     }
 
-    if (!mounted)
+    if (!mounted && !notready_all)
         kmsg_log("boss: hijack-prep 全部路径都失败（2SI 设备上 BOSS 不会被调起）\n");
 
     /* 绝不因为布置失败而让开机停在这里：hijack-prep 失败的原厂行为
