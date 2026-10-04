@@ -432,7 +432,9 @@ static enum boss_layout detect_layout(void)
 /* ---- 劫持落点候选 ----
  * 切根后要落到 /system/bin/init，对应的旧根路径首选 /system/system/bin/init
  * （SAR 布局：system 分区里再套一层 system/，切根后正好映射过去）；
- * 另一种布局退到 /system/bin/init。两个都试，靠 mountinfo 验收。 */
+ * 另一种布局退到 /system/bin/init。两个都试，挂载后用 boss_mount_scan()
+ * 验收——注意**不在这里自己解析挂载表**：解析只有 src/mntinfo.c 一份实现，
+ * 再写一份判定标准迟早会漂移（task5.yml 的 mntinfo-guard 就是守这条的）。 */
 static const char *const hijack_targets[] = {
     "/system/system/bin/init",
     "/system/bin/init",
@@ -467,7 +469,8 @@ static int target_probe(const char *p, char *real, size_t realsz)
 }
 
 /* 验收：目标路径上是不是真有一条挂载。
- * 这一条是整个修复的核心 —— mount() 返回 0 说明不了挂对了地方。 */
+ * 这一条是整个修复的核心 —— mount() 返回 0 说明不了挂对了地方。
+ * 挂载表走 boss_mount_scan()，与全项目共用一份解析。 */
 static int mount_at_is(const char *tgt)
 {
     struct boss_mount **ms = NULL;
@@ -578,7 +581,8 @@ static int cmd_hijack_prep(int argc, char **argv)
      *   1) 不再碰 /sdcard，也不再铺 /storage/self/primary（同样是 init 的地盘）。
      *   2) 挂载点必须是**已经存在的普通文件**。/system 在第一阶段早期还没挂载，
      *      那时挂必然 ENOENT —— 这不算失败，是"时机未到"，留给后续 trigger 重试。
-     *   3) 挂载后**验收**：扫 /proc/self/mountinfo 确认目标路径上真多了一条挂载。
+     *   3) 挂载后**验收**：用 boss_mount_scan()（src/mntinfo.c 那一份解析）
+     *      确认目标路径上真多了一条挂载。
      *      mount() 返回 0 只说明"挂上了"，不说明"挂对了地方"。
      */
     {

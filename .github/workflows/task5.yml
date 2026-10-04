@@ -80,12 +80,24 @@ jobs:
 
       - name: 只应有一处读 mountinfo
         run: |
-          # 只数 .c：boss.h 里那句是注释里的说明文字，不算实现
-          n=$(grep -rl "mountinfo" src/*.c | wc -l)
-          echo "读 mountinfo 的源文件数：$n"
+          # 判据是"**真的打开了这个文件**"，不是"文件里出现过这个词"。
+          # 之前按 mountinfo 这个词 grep，结果别的源文件在注释里提一句
+          # "靠挂载表验收"就把 CI 打红了——那不是第二份实现，是误报。
+          # 真正的第二份实现必然出现 "/proc/self/mountinfo" 这个路径字面量。
+          n=$(grep -rlF "/proc/self/mountinfo" src/*.c | wc -l)
+          echo "实际打开挂载表的源文件数：$n"
           if [ "$n" -ne 1 ]; then
             echo "ERROR: 挂载表解析出现了第二份实现，判定标准会漂移"
-            grep -rn "mountinfo" src/*.c || true
+            grep -rnF "/proc/self/mountinfo" src/*.c || true
+            exit 1
+          fi
+
+          # 顺带确认扫描函数只定义一次（防止有人复制一份到别处改名）
+          m=$(grep -rl "int boss_mount_scan" src/*.c | wc -l)
+          echo "定义 boss_mount_scan 的源文件数：$m"
+          if [ "$m" -ne 1 ]; then
+            echo "ERROR: boss_mount_scan 被定义了多次"
+            grep -rn "int boss_mount_scan" src/*.c || true
             exit 1
           fi
           echo "OK: 解析唯一（src/mntinfo.c）"

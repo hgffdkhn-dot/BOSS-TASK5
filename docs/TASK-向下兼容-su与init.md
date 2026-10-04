@@ -200,6 +200,27 @@ mount(self, "/sdcard")  →  挂到普通文件上是合法的  →  返回 0  �
 三处**：劫持落点位于 `/system` 上，早期 `/system` 没挂载，真正生效的往往是更晚
 的那一趟。hijack-prep 自身幂等（已挂载就跳过），多跑几次没有副作用。
 
+### 顺带：`mntinfo-guard` 的误报与加固
+
+改完上面这些之后，CI 的「挂载解析单一来源自检」报了
+`ERROR: 挂载表解析出现了第二份实现`——但我的 `bossinit.c` **并没有**再写一份解析，
+它只是调用了 `boss_mount_scan()`，注释里提了一句"靠挂载表验收"。
+
+原因是那条守卫按 `grep -l mountinfo src/*.c` 计数，把注释里的提词也算成了实现。
+**真正的第二份实现必然出现 `/proc/self/mountinfo` 这个路径字面量**，所以判据改成：
+
+```bash
+grep -rlF "/proc/self/mountinfo" src/*.c      # 真的打开了这个文件
+grep -rl  "int boss_mount_scan"  src/*.c      # 扫描函数只定义一次
+```
+
+反向验证过：临时塞一个含 `fopen("/proc/self/mountinfo")` 的假文件，两条判据都从
+1 变成 2，会被抓住；删掉后回到 1。也就是说加固没有削弱它——
+**真重复照样红，只是不再被注释里的字眼误伤**。
+
+同时把 `bossinit.c` 的注释改写成显式指向 `boss_mount_scan()`，
+免得下一位读者以为那里另有一套解析。
+
 ### 顺带挖出的第三个 bug：`realpath` 会 abort
 
 改用 `realpath()` 解析目标路径时，最初给了 512 字节缓冲区，结果运行直接
