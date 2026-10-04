@@ -39,13 +39,17 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
     val analyze: StateFlow<List<Pair<String, String>>> = _analyze.asStateFlow()
 
     /**
-     * 用户选定的分区类型。**默认 init_boot**（Android 13+ GKI 主流布局）。
+     * 分区类型。**默认 auto**（交给 CLI 按内容识别）。
      *
-     * 为什么让用户选而不是自动识别：CLI 的 TARGET 字段只是回显传入的 role，
-     * 不是真正的分区判别（实测：同一份镜像传 --boot 就报 TARGET:boot）。
-     * 唯一可靠的信息是 TARGET:none（没 ramdisk）。所以只能由用户指定。
+     * 上游 0.2.0 之前必须手选，因为 CLI 只认 --boot/--init-boot/... 这些 flag，
+     * 而 TARGET 字段又只是回显传入的 role（不是真正的分区判别）。
+     *
+     * 上游修好之后（main.c 新增 guess_role：按 magic 分 vendor_boot/boot，
+     * 再以"无 kernel 但有 ramdisk"判 init_boot），auto 就可靠了，
+     * 实测 init_boot / legacy / vendor_boot 三种镜像都能正确识别。
+     * 手动项保留只是为了少数识别不出来的情况兜底。
      */
-    private val _role = MutableStateFlow("init_boot")
+    private val _role = MutableStateFlow("auto")
     val role: StateFlow<String> = _role.asStateFlow()
 
     fun setRole(r: String) {
@@ -150,11 +154,24 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         val out = repo.outputDir()
         // inject 的镜像**必须**带 role flag：裸位置参数会被 CLI 完全忽略，
         // 表现为退出码 1（旧版连原因都看不到，因为错误走 stderr 未被捕获）。
-        val r = repo.inject(img, pay, out, _role.value)
+        // 默认保留尾部填充：dd 出来的整分区镜像（100MB+）repack 后
+        // 会只剩真正的内容（几十 MB），体积骤降看着像修补坏了。
+        val r = repo.injectKeepTrailing(img, pay, out, _role.value)
         _output.value = r.output
         _patched.value = repo.outputs()
-        _toast.value = if (r.ok()) "修补完成，导出后用 fastboot 刷入"
-                       else "修补失败（退出码 ${r.exitCode}）"
+        if (r.ok()) {
+            val src = File(img).length()
+            val made = repo.outputs().firstOrNull()?.length() ?: 0L
+            // 体积差往往是"尾部填充"，不说明的话用户会以为修补坏了。
+            _toast.value = if (made > 0 && src - made > 1024 * 1024) {
+                "修补完成（${src / 1048576}MB → ${made / 1048576}MB，" +
+                    "差额是分区尾部填充；导出后 fastboot 刷入）"
+            } else {
+                "修补完成，导出后用 fastboot 刷入"
+            }
+        } else {
+            _toast.value = "修补失败（退出码 ${r.exitCode}）"
+        }
     }
 
     fun refreshOutputs() = work { _patched.value = repo.outputs() }

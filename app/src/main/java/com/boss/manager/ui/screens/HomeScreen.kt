@@ -59,6 +59,19 @@ fun HomeScreen(vm: BossViewModel, status: BossStatus?) {
                 KV("manager uid", status.managerUid?.toString() ?: "未注册")
                 KV("模块", "${status.moduleCount} 个")
                 KV("BOSS 挂载", "${status.bossMounts} 条")
+                // 用户明确要求：有 ramdisk 显示"是"，没有显示"否"。
+                // 类型与路径附在后面——模拟器/虚拟机常暴露裸 ramdisk，
+                // 那和真机 boot 镜像的处理路径不同，得让人看见是哪一种。
+                val rd = status.ramdisk
+                KV(
+                    "ramdisk",
+                    if (rd != null) "是（${rd.kind.label}）" else "否",
+                    warn = rd == null,
+                )
+                rd?.let {
+                    KV("  └ 位置", it.path)
+                    KV("  └ 大小", "${it.sizeBytes / 1024} KB")
+                }
             }
         }
 

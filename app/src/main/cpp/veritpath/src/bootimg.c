@@ -9,12 +9,11 @@
 #endif
 
 /* Android boot image headers v0..v4 and vendor_boot v3..v4. */
+#include "compat.h"
 #include "vp.h"
 
 #include <stdlib.h>
 
-#define BOOT_MAGIC "ANDROID!"
-#define VENDOR_MAGIC "VNDRBOOT"
 #define DTB_MAGIC_BE 0xd00dfeedu
 
 static uint32_t rd32(const uint8_t *p, size_t off)
@@ -23,8 +22,20 @@ static uint32_t rd32(const uint8_t *p, size_t off)
                       ((uint32_t)p[off + 3] << 24));
 }
 
-static uint64_t rd64(const uint8_t *p, size_t off)
+/* Same, but bounded. A truncated image must not be read past its end: the
+ * fixed offsets a header version implies are only valid when the file is at
+ * least that long. */
+static uint32_t rd32_at(const uint8_t *p, size_t len, size_t off)
 {
+    if (off + 4 > len)
+        return 0;
+    return rd32(p, off);
+}
+
+static uint64_t rd64_at(const uint8_t *p, size_t len, size_t off)
+{
+    if (off + 8 > len)
+        return 0;
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--)
         v = (v << 8) | p[off + i];
@@ -65,6 +76,7 @@ void boot_img_init(boot_img_t *img)
 {
     memset(img, 0, sizeof(*img));
     buf_init(&img->kernel);
+    buf_init(&img->trailing_data);
     buf_init(&img->ramdisk);
     buf_init(&img->second);
     buf_init(&img->dtb);
@@ -79,6 +91,7 @@ void boot_img_init(boot_img_t *img)
 void boot_img_free(boot_img_t *img)
 {
     buf_free(&img->kernel);
+    buf_free(&img->trailing_data);
     buf_free(&img->ramdisk);
     buf_free(&img->second);
     buf_free(&img->dtb);
@@ -189,12 +202,14 @@ static int header_score(const uint8_t *d, size_t len, size_t off)
         return 0;
     uint32_t ksize = rd32(d, off + 8);
     uint32_t rsize = rd32(d, off + 12);
-    uint32_t total = ksize + rsize;
+    /* 64-bit: ksize + rsize can wrap a uint32 and make a truncated image
+     * look like it fits */
+    uint64_t total = (uint64_t)ksize + rsize;
     if (!(hv24 == 3 || hv24 == 4 || hv24 == 5 || hv24 == 6))
         total += rd32(d, off + 24);
-    if ((size_t)total <= len - off)
+    if (total <= (uint64_t)(len - off))
         score += 15;
-    else if ((size_t)total > len)
+    else if (total > (uint64_t)len)
         score -= 40;
     return score;
 }
@@ -306,7 +321,7 @@ static int ramdisk_window(const uint8_t *d, size_t len, int hv,
             page = 2048;
         size_t hs = boot_header_size((uint32_t)hv);
         if (hv >= 1 && len >= 1648) {
-            uint32_t declared = rd32(d, 1644);
+            uint32_t declared = rd32_at(d, len, 1644);
             if (declared == 1632 || declared == 1648 || declared == 1660)
                 hs = declared;
         }
@@ -421,10 +436,15 @@ static char *copy_cstr(const uint8_t *src, size_t max)
     return out;
 }
 
-static void store_cstr(const uint8_t *src, size_t max, char *dst, size_t dstsz)
+/* Copy up to `max` bytes out of a fixed header slot. `avail` is how much of
+ * the buffer is actually there, so a truncated image stops at the end instead
+ * of reading past it. */
+static void store_cstr(const uint8_t *src, size_t avail, size_t max,
+                       char *dst, size_t dstsz)
 {
+    size_t lim = max < avail ? max : avail;
     size_t n = 0;
-    while (n < max && src[n])
+    while (n < lim && src[n])
         n++;
     if (n >= dstsz)
         n = dstsz - 1;
@@ -441,12 +461,14 @@ static int parse_legacy(const uint8_t *d, size_t len, boot_img_t *img)
     if (!img->page_size)
         img->page_size = 2048;
     img->os_version = rd32(d, 44);
-    store_cstr(d + 48, 16, img->name, sizeof(img->name));
-    store_cstr(d + 64, 512, img->cmdline_main, sizeof(img->cmdline_main));
-    store_cstr(d + 608, 1024, img->cmdline_extra, sizeof(img->cmdline_extra));
+    store_cstr(d + 48, len > 48 ? len - 48 : 0, 16, img->name, sizeof(img->name));
+    store_cstr(d + 64, len > 64 ? len - 64 : 0, 512, img->cmdline_main,
+               sizeof(img->cmdline_main));
+    store_cstr(d + 608, len > 608 ? len - 608 : 0, 1024, img->cmdline_extra,
+               sizeof(img->cmdline_extra));
     size_t hsize = boot_header_size(img->header_version);
     if (img->header_version >= 1) {
-        uint32_t declared = rd32(d, 1644);
+        uint32_t declared = rd32_at(d, len, 1644);
         if (declared == 1632 || declared == 1648 || declared == 1660)
             hsize = declared;
     }
@@ -467,8 +489,8 @@ static int parse_legacy(const uint8_t *d, size_t len, boot_img_t *img)
         buf_append(&img->second, d + off, ssize);
     off = round_up_sz(off + ssize, page);
     if (img->header_version >= 1) {
-        uint32_t rdsize = rd32(d, 1632);
-        uint64_t rdoff = rd64(d, 1636);
+        uint32_t rdsize = rd32_at(d, len, 1632);
+        uint64_t rdoff = rd64_at(d, len, 1636);
         if (!rdoff)
             rdoff = off;
         if (rdsize && rdoff + rdsize <= len)
@@ -476,15 +498,26 @@ static int parse_legacy(const uint8_t *d, size_t len, boot_img_t *img)
         off = round_up_sz(rdoff + rdsize, page);
     }
     if (img->header_version >= 2) {
-        uint32_t dtbsize = rd32(d, 1648);
+        uint32_t dtbsize = rd32_at(d, len, 1648);
         if (dtbsize && off + dtbsize <= len)
             buf_append(&img->dtb, d + off, dtbsize);
+        off = round_up_sz(off + dtbsize, page);
     }
+    img->trailing = len > off ? len - off : 0;
+    if (img->trailing && img->trailing <= (256u << 20))
+        buf_append(&img->trailing_data, d + off, img->trailing);
     return 0;
 }
 
 static int parse_v3(const uint8_t *d, size_t len, boot_img_t *img)
 {
+    /* v3 is 1580 bytes and v4 indexes the signature size at 1564 */
+    if (len < 64) {
+        vp_err("%s: v3/v4 image is truncated (%zu bytes)",
+               img->path ? img->path : "<memory>", len);
+        return -1;
+    }
+
     uint32_t ksize = rd32(d, 8);
     uint32_t rsize = rd32(d, 12);
     img->os_version = rd32(d, 16);
@@ -496,7 +529,8 @@ static int parse_v3(const uint8_t *d, size_t len, boot_img_t *img)
     /* vendor tools write page-padded / zeroed / garbage header sizes */
     if (declared >= 1500 && declared <= 4096)
         hsize = declared;
-    store_cstr(d + 28, 1536, img->cmdline, sizeof(img->cmdline));
+    store_cstr(d + 28, len > 28 ? len - 28 : 0, 1536, img->cmdline,
+               sizeof(img->cmdline));
     img->page_size = 4096;
     img->header_span = round_up_sz(hsize, img->page_size);
     if (img->header_span > len)
@@ -511,7 +545,7 @@ static int parse_v3(const uint8_t *d, size_t len, boot_img_t *img)
         buf_append(&img->ramdisk, d + off, rsize);
     off = round_up_sz(off + rsize, img->page_size);
     if (img->header_version >= 4) {
-        uint32_t sigsize = rd32(d, 1564);
+        uint32_t sigsize = rd32_at(d, len, 1564);
         if (sigsize && off + sigsize <= len)
             buf_append(&img->boot_signature, d + off, sigsize);
     }
@@ -522,20 +556,32 @@ static int parse_v3(const uint8_t *d, size_t len, boot_img_t *img)
             break;
         }
     }
+    if (img->header_version >= 4)
+        off = round_up_sz(off + img->boot_signature.len, img->page_size);
+    img->trailing = len > off ? len - off : 0;
+    if (img->trailing && img->trailing <= (256u << 20))
+        buf_append(&img->trailing_data, d + off, img->trailing);
     return 0;
 }
 
 static int parse_vendor(const uint8_t *d, size_t len, boot_img_t *img)
 {
+    if (len < 2100) {
+        vp_err("%s: vendor image is truncated (%zu bytes, need at least 2100)",
+               img->path ? img->path : "<memory>", len);
+        return -1;
+    }
     img->is_vendor = 1;
-    img->header_version = rd32(d, 8);
-    img->page_size = rd32(d, 12);
+    img->header_version = rd32_at(d, len, 8);
+    img->page_size = rd32_at(d, len, 12);
     if (!img->page_size)
         img->page_size = 4096;
     uint32_t rsize = rd32(d, 24);
-    store_cstr(d + 28, 2048, img->cmdline, sizeof(img->cmdline));
-    store_cstr(d + 2080, 16, img->name, sizeof(img->name));
-    uint32_t dtbsize = rd32(d, 2096);
+    store_cstr(d + 28, len > 28 ? len - 28 : 0, 2048, img->cmdline,
+               sizeof(img->cmdline));
+    store_cstr(d + 2080, len > 2080 ? len - 2080 : 0, 16, img->name,
+               sizeof(img->name));
+    uint32_t dtbsize = rd32_at(d, len, 2096);
     size_t hsize = vendor_header_size(img->header_version);
     img->header_span = round_up_sz(hsize, img->page_size);
     if (img->header_span > len)
@@ -551,10 +597,11 @@ static int parse_vendor(const uint8_t *d, size_t len, boot_img_t *img)
         buf_append(&img->dtb, d + off, dtbsize);
     off = round_up_sz(off + dtbsize, page);
     if (img->header_version >= 4) {
-        uint32_t tsize = rd32(d, 2108);
-        uint32_t tnum = rd32(d, 2112);
-        uint32_t esize = rd32(d, 2116);
-        uint32_t bcsize = rd32(d, 2120);
+        /* the v4 fragment table header runs to offset 2124 */
+        uint32_t tsize = rd32_at(d, len, 2108);
+        uint32_t tnum = rd32_at(d, len, 2112);
+        uint32_t esize = rd32_at(d, len, 2116);
+        uint32_t bcsize = rd32_at(d, len, 2120);
         if (!esize)
             esize = 108;
         img->frag_entry_size = esize;
@@ -581,7 +628,11 @@ static int parse_vendor(const uint8_t *d, size_t len, boot_img_t *img)
         off = round_up_sz(off + tsize, page);
         if (bcsize && off + bcsize <= len)
             buf_append(&img->bootconfig, d + off, bcsize);
+        off = round_up_sz(off + bcsize, page);
     }
+    img->trailing = len > off ? len - off : 0;
+    if (img->trailing && img->trailing <= (256u << 20))
+        buf_append(&img->trailing_data, d + off, img->trailing);
     return 0;
 }
 
@@ -630,6 +681,15 @@ int boot_img_parse(const uint8_t *data, size_t len, const char *role,
                 img->path ? img->path : "<memory>", off);
         data += off;
         len -= off;
+    }
+
+    /* A header is a fixed-size structure at fixed offsets. Reading it from a
+     * shorter buffer is an out-of-bounds read, so reject the file up front
+     * instead of relying on every field access to be guarded. */
+    if (len < 64) {
+        vp_err("%s: image is truncated (%zu bytes, need at least 64 for a header)",
+               img->path ? img->path : "<memory>", len);
+        return -1;
     }
 
     if (magic == 2)
@@ -721,11 +781,70 @@ buf_t *boot_img_dtb(boot_img_t *img)
     return img->dtb.len ? &img->dtb : NULL;
 }
 
+/* A vendor ramdisk is several independently compressed fragments back to back.
+ * Sniffing compression cannot tell where one ends and the next begins, so use
+ * the fragment table when it is available - otherwise the whole thing looks
+ * like a single chunk and rebuilding collapses the fragments into one. */
+static int vendor_split_by_fragments(boot_img_t *img, comp_chunks_t *chunks)
+{
+    if (!img->is_vendor || img->n_frags < 2)
+        return -1;
+
+    memset(chunks, 0, sizeof(*chunks));
+    chunks->items = xmalloc(sizeof(comp_chunk_t) * img->n_frags);
+    for (size_t i = 0; i < img->n_frags; i++) {
+        size_t off = img->frags[i].offset;
+        size_t size = img->frags[i].size;
+        if (!size || off >= img->ramdisk.len) {
+            /* fall back: assume fragments are laid out consecutively */
+            off = i ? img->frags[i - 1].offset + img->frags[i - 1].size : 0;
+            size = 0;
+        }
+        if (off >= img->ramdisk.len) {
+            chunks->n = 0;
+            return -1;
+        }
+        if (!size || off + size > img->ramdisk.len)
+            size = img->ramdisk.len - off;
+
+        comp_chunk_t *c = &chunks->items[chunks->n];
+        memset(c, 0, sizeof(*c));
+        c->fmt = comp_detect(img->ramdisk.data + off, size);
+        buf_init(&c->data);
+        buf_t raw;
+        buf_init(&raw);
+        if (comp_decompress(img->ramdisk.data + off, size, &raw) == 0 && raw.len)
+            buf_append(&c->data, raw.data, raw.len);
+        else
+            buf_append(&c->data, img->ramdisk.data + off, size);
+        buf_free(&raw);
+        chunks->n++;
+    }
+    /* remember the real extents so packing can honour them */
+    free(img->chunk_fmts);
+    img->chunk_fmts = xmalloc(sizeof(comp_fmt_t) * chunks->n);
+    img->n_chunks = chunks->n;
+    for (size_t i = 0; i < chunks->n; i++)
+        img->chunk_fmts[i] = chunks->items[i].fmt;
+    return chunks->n > 0 ? 0 : -1;
+}
+
 int boot_img_ramdisk_archive(boot_img_t *img, cpio_archive_t *a)
 {
     if (!img->ramdisk.len)
         return -1;
     comp_chunks_t chunks;
+    memset(&chunks, 0, sizeof(chunks));
+    if (vendor_split_by_fragments(img, &chunks) == 0) {
+        buf_t raw;
+        buf_init(&raw);
+        for (size_t i = 0; i < chunks.n; i++)
+            buf_append(&raw, chunks.items[i].data.data, chunks.items[i].data.len);
+        int rc = cpio_parse(raw.data, raw.len, a);
+        buf_free(&raw);
+        comp_chunks_free(&chunks);
+        return rc;
+    }
     if (comp_split(img->ramdisk.data, img->ramdisk.len, &chunks) != 0)
         return -1;
     buf_t raw;
@@ -756,27 +875,68 @@ int boot_img_set_ramdisk(boot_img_t *img, cpio_archive_t *a, int force)
     uint32_t *csizes = xmalloc(sizeof(uint32_t) * (a->n ? a->n : 1));
     memset(csizes, 0, sizeof(uint32_t) * (a->n ? a->n : 1));
 
-    if (a->n > 1 && (force >= 0 || img->n_chunks == a->n)) {
+    int per_fragment = (img->is_vendor && img->n_frags > 1 && img->n_frags == a->n);
+
+    /* Does the original lay its fragments out page-aligned or back to back?
+     * The packed ramdisk has to match, or the offsets in the table point into
+     * the middle of a fragment. */
+    int page_aligned = 0;
+    if (per_fragment && img->n_frags > 1 && img->page_size) {
+        page_aligned = 1;
+        size_t expect = img->frags[0].offset;
+        for (size_t i = 1; i < img->n_frags; i++) {
+            expect = round_up_sz(expect + img->frags[i - 1].size, img->page_size);
+            if (expect != img->frags[i].offset) {
+                page_aligned = 0;
+                break;
+            }
+        }
+    }
+
+    if (a->n > 1 && (per_fragment || force >= 0 || img->n_chunks == a->n)) {
         /* every segment keeps its own compression (vendor_boot fragments) */
         for (size_t i = 0; i < a->n; i++) {
             buf_t c;
             buf_init(&c);
-            comp_fmt_t fmt = force >= 0 ? (comp_fmt_t)force : img->chunk_fmts[i];
+            comp_fmt_t fmt;
+            if (force >= 0)
+                fmt = (comp_fmt_t)force;
+            else if (img->chunk_fmts && i < img->n_chunks)
+                fmt = img->chunk_fmts[i];
+            else
+                /* no per-chunk info (e.g. a ramdisk rebuilt from a directory
+                 * rather than read back from the image): fall back to what the
+                 * original ramdisk actually used */
+                fmt = comp_detect(img->ramdisk.data, img->ramdisk.len);
             if (fmt == FMT_RAW)
                 fmt = FMT_GZIP;
             comp_compress(segs[i].data, segs[i].len, fmt, &c);
             buf_append(&out, c.data, c.len);
             csizes[i] = (uint32_t)c.len;
             buf_free(&c);
+            if (page_aligned && i + 1 < a->n) {
+                size_t want = round_up_sz(out.len, img->page_size);
+                if (want > out.len) {
+                    size_t n = want - out.len;
+                    uint8_t *pad = xmalloc(n);
+                    memset(pad, 0, n);
+                    buf_append(&out, pad, n);
+                    free(pad);
+                }
+            }
         }
     } else {
         buf_t joined;
         buf_init(&joined);
         for (size_t i = 0; i < a->n; i++)
             buf_append(&joined, segs[i].data, segs[i].len);
-        comp_fmt_t fmt =
-            force >= 0 ? (comp_fmt_t)force
-                      : (img->n_chunks ? img->chunk_fmts[0] : FMT_GZIP);
+        comp_fmt_t fmt;
+        if (force >= 0)
+            fmt = (comp_fmt_t)force;
+        else if (img->chunk_fmts && img->n_chunks)
+            fmt = img->chunk_fmts[0];
+        else
+            fmt = comp_detect(img->ramdisk.data, img->ramdisk.len);
         if (fmt == FMT_RAW)
             fmt = FMT_GZIP;
         comp_compress(joined.data, joined.len, fmt, &out);
@@ -788,18 +948,21 @@ int boot_img_set_ramdisk(boot_img_t *img, cpio_archive_t *a, int force)
         buf_free(&segs[i]);
     free(segs);
 
-    /* keep the vendor ramdisk fragment table in sync with the new sizes */
-    if (img->is_vendor && img->n_frags == a->n && a->n > 0) {
-        uint32_t delta = 0;
+    /* Keep the vendor ramdisk fragment table in sync with the new sizes.
+     *
+     * Offsets are recomputed rather than shifted: fragments are padded (to a
+     * page in every image seen so far), so carrying a delta forward puts the
+     * next fragment at the wrong place. Preserve whichever convention the
+     * original used - page-aligned or back-to-back.
+     */
+    if (img->is_vendor && img->n_frags == a->n && a->n > 0 && per_fragment) {
+        size_t at = img->frags[0].offset;
         for (size_t i = 0; i < img->n_frags; i++) {
-            uint32_t old = img->frags[i].size;
-            img->frags[i].offset += delta;
+            img->frags[i].offset = (uint32_t)at;
             img->frags[i].size = csizes[i];
-            delta += csizes[i] - old;
-        }
-        if (a->n == 1) {
-            /* one fragment: the single blob covers everything */
-            img->frags[0].size = (uint32_t)out.len;
+            at += csizes[i];
+            if (page_aligned)
+                at = round_up_sz(at, img->page_size);
         }
     }
     free(csizes);
@@ -811,6 +974,11 @@ int boot_img_set_ramdisk(boot_img_t *img, cpio_archive_t *a, int force)
 }
 
 int boot_img_pack(boot_img_t *img, buf_t *out)
+{
+    return boot_img_pack_ex(img, out, 0);
+}
+
+int boot_img_pack_ex(boot_img_t *img, buf_t *out, int keep_trailing)
 {
     size_t page = img->is_vendor ? img->page_size : (img->header_version <= 2 ? img->page_size : 4096);
     buf_t header;
@@ -888,7 +1056,7 @@ int boot_img_pack(boot_img_t *img, buf_t *out)
             buf_append_pad(out, page, 0);
         }
         buf_free(&header);
-        return 0;
+        goto done;
     }
 
     if (img->header_version <= 2) {
@@ -947,5 +1115,15 @@ int boot_img_pack(boot_img_t *img, buf_t *out)
         buf_append_pad(out, page, 0);
     }
     buf_free(&header);
+done:
+    if (keep_trailing && img->trailing_data.len)
+        buf_append(out, img->trailing_data.data, img->trailing_data.len);
     return 0;
+}
+
+/* How many bytes follow the image proper. Non-zero means the file is bigger
+ * than the boot image - normally a whole-partition dump. */
+size_t boot_img_trailing(const boot_img_t *img)
+{
+    return img ? img->trailing : 0;
 }

@@ -9,6 +9,7 @@
 #endif
 
 /* Counter-measure plan printing. */
+#include "compat.h"
 #include "vp.h"
 
 #include <stdlib.h>
@@ -32,8 +33,9 @@ static const char *layout_advice(const char *layout)
     if (strcmp(layout, "boot") == 0)
         return "Ramdisk lives inside this image (Android <= 12 non-GKI). Patch it "
                "directly; kernel and DTB stay untouched.";
-    return "No ramdisk located. Supply init_boot.img (Android 13+) or a boot.img "
-           "that actually contains one.";
+    return "No ramdisk located. Supply init_boot.img / vendor_boot.img (Android "
+           "13+ GKI), or use --create-ramdisk to build one for a system-as-root "
+           "device that boots without an initramfs.";
 }
 
 void strategy_print_plan(analysis_t *res, payload_t *p, options_t *o, int as_json)
@@ -56,6 +58,12 @@ void strategy_print_plan(analysis_t *res, payload_t *p, options_t *o, int as_jso
     printf("system-as-root  : %s\n", res->system_as_root ? "true" : "false");
     printf("GKI             : %s\n", res->gki ? "true" : "false");
     printf("target image    : %s\n", res->target[0] ? res->target : "(none)");
+    if (res->needs_ramdisk && !o->create_ramdisk)
+        printf("  - no ramdisk exists; --create-ramdisk is required for this "
+               "image\n");
+    if (res->needs_ramdisk && o->create_ramdisk)
+        printf("  - create a ramdisk (directories, init.rc, file_contexts), then "
+               "apply the payload\n");
     if (o->patch_vendor_boot)
         puts("extra targets   : vendor_boot");
     puts("");

@@ -9,6 +9,7 @@
 #endif
 
 /* cpio "newc" archives, with Android multi-segment support. */
+#include "compat.h"
 #include "vp.h"
 
 #include <dirent.h>
@@ -40,6 +41,7 @@ static int vp_stat(const char *path, struct stat *st)
 #ifdef _WIN32
 static int vp_is_link(const char *full)
 {
+    (void)full;
     return 0; /* Windows unpack never sees real symlinks in a ramdisk */
 }
 static int vp_compat_symlink(const char *target, const char *linkpath)
@@ -127,6 +129,7 @@ static void put_hex32(uint8_t *p, uint32_t v)
 }
 
 /* strip leading "./" and "/" */
+/* Entry names are attacker-controlled (see vp_path_is_safe in util.c). */
 static const char *norm_name(const char *n)
 {
     while (n[0] == '.' && n[1] == '/')
@@ -204,6 +207,9 @@ static const char *guess_label(cpio_seg_t *s)
 
 int cpio_parse(const uint8_t *data, size_t len, cpio_archive_t *a)
 {
+    /* Contract on failure: `a` is left empty and safe to cpio_free().
+     * Previously a partially built archive was left behind, and callers that
+     * bail out without calling cpio_free() leaked every segment and entry. */
     size_t pos = 0;
     while (pos < len) {
         if (pos + 6 > len)
@@ -223,7 +229,7 @@ int cpio_parse(const uint8_t *data, size_t len, cpio_archive_t *a)
         cpio_seg_t *s = seg_push(a);
         for (;;) {
             if (pos + CPIO_HDR > len)
-                return -1;
+                goto fail;
             const uint8_t *h = data + pos;
             uint32_t ino = hex32(h + 6);
             uint32_t mode = hex32(h + 14);
@@ -238,15 +244,15 @@ int cpio_parse(const uint8_t *data, size_t len, cpio_archive_t *a)
             uint32_t rdevmin = hex32(h + 86);
             uint32_t namesize = hex32(h + 94);
             if (namesize < 1 || pos + CPIO_HDR + namesize > len)
-                return -1;
+                goto fail;
             char *name = xmalloc(namesize);
             memcpy(name, h + CPIO_HDR, namesize - 1);
             name[namesize - 1] = 0;
             size_t dstart = align4(pos + CPIO_HDR + namesize);
             size_t dend = dstart + fsize;
-            if (dend > len) {
+            if (dend > len || dend < dstart) {
                 free(name);
-                return -1;
+                goto fail;
             }
             pos = align4(dend);
             if (strcmp(name, CPIO_TRAILER) == 0) {
@@ -286,6 +292,11 @@ int cpio_parse(const uint8_t *data, size_t len, cpio_archive_t *a)
     if (a->n == 0)
         return -1;
     return 0;
+
+fail:
+    cpio_free(a);
+    cpio_init(a);
+    return -1;
 }
 
 static void write_entry(buf_t *out, const cpio_entry_t *e, uint32_t ino)
@@ -383,8 +394,16 @@ int cpio_add(cpio_archive_t *a, size_t seg, const cpio_entry_t *entry)
     cpio_seg_t *s = &a->segs[seg];
     cpio_entry_t *old = cpio_seg_find(s, entry->name);
     if (old) {
+        /* Copy, exactly like the insert path below. This used to steal the
+         * caller's name/data, so replacing an existing entry (payload init over
+         * a skeleton /init, say) left the caller to free them a second time -
+         * a use-after-free ASAN catches immediately. */
         cpio_entry_free(old);
-        *old = *entry;
+        cpio_entry_t copy = *entry;
+        copy.name = xstrdup(entry->name);
+        buf_init(&copy.data);
+        buf_append(&copy.data, entry->data.data, entry->data.len);
+        *old = copy;
         return 1; /* replaced */
     }
     cpio_entry_t copy = *entry;
@@ -455,7 +474,13 @@ int cpio_extract_dir(cpio_archive_t *a, const char *root)
         free(label);
         for (size_t j = 0; j < s->n; j++) {
             cpio_entry_t *e = &s->entries[j];
-            char *target = path_join(base, norm_name(e->name));
+            const char *rel = norm_name(e->name);
+            if (!vp_path_is_safe(rel)) {
+                vp_warn("refusing an entry that escapes the output directory: "
+                        "%s", e->name);
+                continue;
+            }
+            char *target = path_join(base, rel);
             char *parent = xstrdup(target);
             char *slash = strrchr(parent, '/');
             if (slash) {
@@ -464,12 +489,25 @@ int cpio_extract_dir(cpio_archive_t *a, const char *root)
             }
             free(parent);
             if (CPIO_IS_DIR(e)) {
+                /* do not let a symlink planted by an earlier entry redirect
+                 * this directory outside the tree */
+                if (vp_is_link(target))
+                    unlink(target);
                 mkdir_p(target);
             } else if (CPIO_IS_LINK(e)) {
+                /* A symlink target is just a string and absolute targets are
+                 * normal in an Android ramdisk (/init -> /system/bin/init), so
+                 * they are allowed. What must not happen is a later entry
+                 * being written *through* a symlink, which is handled below
+                 * by unlinking the path before writing. */
                 unlink(target);
-                if (vp_compat_symlink((const char *)e->data.data, target) != 0)
+                const char *lt = (const char *)e->data.data;
+                if (vp_compat_symlink(lt, target) != 0)
                     vp_warn("cannot create symlink %s", target);
             } else {
+                /* same reason: fopen() follows a symlink, so drop one first */
+                if (vp_is_link(target))
+                    unlink(target);
                 FILE *of = fopen(target, "wb");
                 if (of) {
                     if (e->data.len)
@@ -609,4 +647,114 @@ int cpio_build_dir(const char *root, cpio_archive_t *a)
     }
     closedir(d);
     return 0;
+}
+
+/* --------------------------------------------------------- ramdisk skeleton
+ *
+ * Some devices boot with no ramdisk at all: system-as-root mounts /system as /
+ * and the kernel runs /system/bin/init straight from there, so boot.img carries
+ * only a kernel and a dtb. To patch such a device you have to *create* a
+ * ramdisk, because there is nothing to patch.
+ *
+ * This builds the directory tree and the files every Android first-stage init
+ * expects. It does NOT contain a working init - see cpio_create_skeleton().
+ */
+#define VP_PLACEHOLDER_MARKER "veritpath-placeholder-init"
+
+static void skel_dir(cpio_archive_t *a, size_t seg, const char *path)
+{
+    if (cpio_find(a, path))
+        return;
+    cpio_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.name = xstrdup(path);
+    e.mode = 0040755;
+    e.nlink = 2;
+    buf_init(&e.data);
+    cpio_add(a, seg, &e);
+    free(e.name);
+}
+
+static void skel_file(cpio_archive_t *a, size_t seg, const char *path,
+                      unsigned mode, const char *content)
+{
+    cpio_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.name = xstrdup(path);
+    e.mode = mode;
+    e.nlink = 1;
+    buf_init(&e.data);
+    buf_append(&e.data, content, strlen(content));
+    cpio_add(a, seg, &e);
+    free(e.name);
+    buf_free(&e.data);
+}
+
+int cpio_create_skeleton(cpio_archive_t *a)
+{
+    static const char *dirs[] = {
+        "/dev", "/proc", "/sys", "/system", "/data", "/mnt", "/apex",
+        "/debug_ramdisk", "/storage", "/acct", "/config", "/cache",
+        "/metadata", "/second_stage_resources",
+    };
+    skel_dir(a, 0, "/");
+    /* note: cpio_ensure_dir() only creates the *parents* of a path, so the
+     * top-level mount points have to be added explicitly */
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        skel_dir(a, 0, dirs[i]);
+
+    /* init.rc is what makes the payload reachable: Android's init imports
+     * whatever is listed here before running its own sections. */
+    skel_file(a, 0, "/init.rc", 0100644,
+              "# veritpath skeleton init.rc\n"
+              "# Imported first so the payload is set up before init proceeds.\n"
+              "import /init.veritpath.rc\n"
+              "\n"
+              "on early-init\n"
+              "    mkdir /dev 0755\n"
+              "    mount proc proc /proc\n"
+              "    mount sysfs sysfs /sys\n"
+              "\n"
+              "on init\n"
+              "    mkdir /system 0755\n");
+
+    /* empty but present: init fails to start without a file_contexts */
+    skel_file(a, 0, "/file_contexts", 0100644,
+              "# veritpath skeleton: add your own labels here\n");
+
+    skel_file(a, 0, "/init", 0100755,
+              "#!/system/bin/sh\n"
+              "# " VP_PLACEHOLDER_MARKER "\n"
+              "#\n"
+              "# PLACEHOLDER - this will NOT boot a device.\n"
+              "#\n"
+              "# This ramdisk was created by veritpath because the boot.img carried\n"
+              "# none. At first-stage init there is no /system yet, so the shell\n"
+              "# above does not exist either - this file only documents the shape.\n"
+              "#\n"
+              "# Replace /init with a real static first-stage init (your own, or\n"
+              "# magiskinit). It has to:\n"
+              "#   1. do whatever your payload needs\n"
+              "#   2. mount /system (system-as-root: the kernel does not do it)\n"
+              "#   3. exec the original init, normally /system/bin/init\n"
+              "#\n"
+              "# veritpath inject -p payload --create-ramdisk  drops your init in\n"
+              "# place of this file if the payload declares dest \"/init\".\n");
+
+    skel_file(a, 0, "/veritpath-skeleton.txt", 0100644,
+              "This ramdisk was created by veritpath because the image carried\n"
+              "none (system-as-root device).\n"
+              "\n"
+              "Replace /init with a real static first-stage init before flashing.\n"
+              "The original init lives on /system (usually /system/bin/init).\n");
+    return 0;
+}
+
+int cpio_has_placeholder_init(cpio_archive_t *a)
+{
+    cpio_entry_t *e = cpio_find(a, "init");
+    if (!e)
+        return 1;               /* no init at all is even worse */
+    return vp_memmem(e->data.data, e->data.len, VP_PLACEHOLDER_MARKER,
+                     strlen(VP_PLACEHOLDER_MARKER)) != NULL;
 }

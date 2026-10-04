@@ -8,11 +8,13 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include "compat.h"
 #include <limits.h>
 #include "vp.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -235,6 +237,14 @@ int read_file(const char *path, buf_t *out)
         buf_append(out, tmp, got);
     int bad = ferror(f);
     fclose(f);
+    /* An empty file left out->data NULL, and callers hand it straight to
+     * strlen()/memcmp() - which is UB for a null pointer. Always leave a
+     * valid, NUL-terminated buffer behind. */
+    if (!out->data) {
+        buf_reserve(out, 0);
+        if (out->data)
+            out->data[0] = 0;
+    }
     return bad ? -1 : 0;
 }
 
@@ -245,11 +255,11 @@ int mkdir_p(const char *path)
     for (size_t i = 1; i < n; i++) {
         if (tmp[i] == '/') {
             tmp[i] = 0;
-            mkdir(tmp, 0755);
+            vp_mkdir_one(tmp);
             tmp[i] = '/';
         }
     }
-    int r = mkdir(tmp, 0755);
+    int r = vp_mkdir_one(tmp);
     free(tmp);
     return (r == 0 || errno == EEXIST) ? 0 : -1;
 }
@@ -343,7 +353,12 @@ char *replace_suffix(const char *path, const char *suffix)
 void vp_report_missing(const char *role, const char *path)
 {
     char abs[PATH_MAX];
+#ifdef VP_NO_REALPATH
+    /* MinGW has no realpath(); the fallback below is all we need here */
+    if (1) {
+#else
     if (!realpath(path, abs)) {
+#endif
         /* realpath fails when the file is absent - build the path by hand */
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof(cwd)))
@@ -416,97 +431,238 @@ void vp_report_missing(const char *role, const char *path)
 
 /* --------------------------------------------------------- output capture
  *
- * Embedders (the JNI binding, unit tests, other tools) need the command output
- * as a string instead of on stdout. Duplicate the fd onto a temp file rather
- * than reassigning the stdout FILE*, which is not portable.
+ * Embedders (the JNI binding, tests, other tools) need a command's output as a
+ * string. Two requirements drove this design:
+ *
+ * 1. Errors go to stderr. Capturing only stdout means a failing command returns
+ *    an empty string, which reads as "the tool produced nothing".
+ * 2. It must not touch the filesystem. An Android app has no writable /tmp, the
+ *    current directory is "/" (not writable), TMPDIR is unset, and /data/local/tmp
+ *    belongs to the shell - none of them are usable from a normal app process.
+ *    Guessing at those paths just reintroduces the failure.
+ *
+ * So: a pipe, drained into memory. No files, no permissions, no paths. The write
+ * end is non-blocking so a single-threaded caller can never deadlock, even if a
+ * command somehow produces more output than the pipe can hold.
  */
-static int g_saved_fd = -1;
-static int g_saved_err_fd = -1;   /* BOSS-PATCH */
-static FILE *g_cap_file = NULL;
+static int g_cap_rfd = -1;
+static int g_cap_wfd = -1;
+static int g_saved_out = -1;
+static int g_saved_err = -1;
+static int g_cap_active = 0;
+#if defined(_WIN32) || defined(_WIN64)
+static FILE *g_cap_file = NULL;  /* the scratch stream, read back in stop() */
+#endif
+static char *g_cap_dir = NULL;   /* Windows-only: where the scratch file goes */
+static char g_cap_why[256];
+#if defined(_WIN32) || defined(_WIN64)
+static char *g_cap_path = NULL;  /* name of the scratch file, deleted in stop() */
+static int g_cap_seq = 0;
+#endif
 
-/* BOSS-PATCH（开始）
- *
- * 上游只把 **stdout** 重定向到捕获文件，stderr 原样留在真 stderr 上。
- * 而 veritpath 的全部错误信息都走 vp_err() → stderr。
- * 于是 JNI 侧拿到的是"退出码 1、输出空字符串"——
- * 界面上表现为"修补失败，输出无"，一句原因都看不到。
- * 真机上更糟：native stderr 在 App 里基本不可见，等于没有任何线索。
- *
- * 实测（vendored 源码编出的 CLI）：
- *   inject <img> -p dir -o out      → 退出码 1，stdout 空，
- *                                     stderr: "no input images given (use --boot/...)"
- * 这正是用户看到的现象。
- *
- * 改法：把 stderr 一起重定向到同一个 tmpfile。合并顺序不做保证，
- * 但"能看到原因"远比"顺序好看"重要。
- *
- * ⚠️ 这是**对 vendored 源码的本地修改**。上游同步会把 util.c 覆盖掉，
- *    届时这段要重新加上。tools/check_android_toolchain.sh 的 4.9 节会检查
- *    这个标记还在不在——丢了就报 FAIL，不会静默退化成"输出无"。
- */
+void vp_capture_set_dir(const char *dir)
+{
+    free(g_cap_dir);
+    g_cap_dir = (dir && *dir) ? xstrdup(dir) : NULL;
+}
+
+const char *vp_capture_error(void)
+{
+    return g_cap_why[0] ? g_cap_why : NULL;
+}
+
+static void set_nonblock(int fd)
+{
+#if defined(_WIN32) || defined(_WIN64)
+    (void)fd;
+#else
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0)
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+#endif
+}
+
+static void grow_pipe(int fd)
+{
+#if defined(F_SETPIPE_SZ) && !defined(_WIN32) && !defined(_WIN64)
+    /* best effort: 1MiB instead of the default 64KiB */
+    fcntl(fd, F_SETPIPE_SZ, 1 << 20);
+#else
+    (void)fd;
+#endif
+}
+
 int vp_capture_start(void)
 {
-    if (g_cap_file)
-        return -1;                      /* already capturing */
+    if (g_cap_active)
+        return -1;
     fflush(stdout);
     fflush(stderr);
-    g_cap_file = tmpfile();
-    if (!g_cap_file)
-        return -1;
-    g_saved_fd = dup(STDOUT_FILENO);
-    if (g_saved_fd < 0) {
-        fclose(g_cap_file);
-        g_cap_file = NULL;
+    g_cap_why[0] = 0;
+
+    int fds[2];
+    int got = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    /* _pipe() is not declared on every MinGW, so use a scratch file in the
+     * directory the caller supplied and redirect through its stream fd. */
+    if (g_cap_dir) {
+        free(g_cap_path);
+        g_cap_path = NULL;
+        size_t len = strlen(g_cap_dir) + 64;
+        g_cap_path = xmalloc(len);
+        snprintf(g_cap_path, len, "%s\\vp-cap-%ld-%d.tmp", g_cap_dir,
+                 (long)getpid(), g_cap_seq++);
+        FILE *f = fopen(g_cap_path, "w+b");
+        if (f) {
+            int fd = _fileno(f);
+            if (fd >= 0) {
+                fds[0] = fd;
+                fds[1] = dup(fd);
+                got = 1;
+                g_cap_file = f;   /* read back through the stream in stop() */
+            } else {
+                fclose(f);
+            }
+        }
+    }
+    if (!got) {
+        snprintf(g_cap_why, sizeof(g_cap_why),
+                 "Windows capture needs vp_capture_set_dir()");
         return -1;
     }
-    if (dup2(fileno(g_cap_file), STDOUT_FILENO) < 0) {
-        close(g_saved_fd);
-        g_saved_fd = -1;
-        fclose(g_cap_file);
-        g_cap_file = NULL;
-        return -1;
+#else
+    got = (pipe(fds) == 0);
+#endif
+    if (!got) {
+        /* Last resort, and only where the caller said it is safe. No guessing:
+         * an app process has no writable /tmp, and /data/local/tmp belongs to
+         * the shell - trying them just fails again. */
+        if (!g_cap_dir) {
+            snprintf(g_cap_why, sizeof(g_cap_why),
+                     "cannot create a pipe for output capture");
+            return -1;
+        }
+        size_t len = strlen(g_cap_dir) + 32;
+        char *tpl = xmalloc(len);
+        snprintf(tpl, len, "%s/.veritpath-XXXXXX", g_cap_dir);
+        int fd = mkstemp(tpl);
+        free(tpl);
+        if (fd < 0) {
+            snprintf(g_cap_why, sizeof(g_cap_why),
+                     "cannot create a scratch file in %s", g_cap_dir);
+            return -1;
+        }
+        fds[0] = fd;
+        fds[1] = dup(fd);
     }
-    g_saved_err_fd = dup(STDERR_FILENO);                    /* BOSS-PATCH */
-    if (g_saved_err_fd >= 0)                                /* BOSS-PATCH */
-        dup2(fileno(g_cap_file), STDERR_FILENO);            /* BOSS-PATCH */
+    grow_pipe(fds[1]);
+    set_nonblock(fds[1]);
+
+    g_saved_out = dup(STDOUT_FILENO);
+    g_saved_err = dup(STDERR_FILENO);
+    /* both ends share one file description, so stdout and stderr interleave in
+     * the order they were written */
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+
+    g_cap_rfd = fds[0];
+    g_cap_wfd = fds[1];
+    g_cap_active = 1;
     return 0;
 }
 
 char *vp_capture_stop(void)
 {
     fflush(stdout);
-    fflush(stderr);                                          /* BOSS-PATCH */
-    if (g_saved_fd >= 0) {
-        dup2(g_saved_fd, STDOUT_FILENO);
-        close(g_saved_fd);
-        g_saved_fd = -1;
+    fflush(stderr);
+
+    if (g_saved_err >= 0) {
+        dup2(g_saved_err, STDERR_FILENO);
+        close(g_saved_err);
+        g_saved_err = -1;
     }
-    if (g_saved_err_fd >= 0) {                               /* BOSS-PATCH */
-        dup2(g_saved_err_fd, STDERR_FILENO);                 /* BOSS-PATCH */
-        close(g_saved_err_fd);                               /* BOSS-PATCH */
-        g_saved_err_fd = -1;                                 /* BOSS-PATCH */
-    }                                                        /* BOSS-PATCH */
-    if (!g_cap_file)
+    if (g_saved_out >= 0) {
+        dup2(g_saved_out, STDOUT_FILENO);
+        close(g_saved_out);
+        g_saved_out = -1;
+    }
+    /* a write may have hit EAGAIN while the pipe was in non-blocking mode */
+    clearerr(stdout);
+    clearerr(stderr);
+
+    if (!g_cap_active)
         return NULL;
 
-    rewind(g_cap_file);
-    size_t cap = 4096, len = 0;
+    if (g_cap_wfd >= 0) {
+        close(g_cap_wfd);
+        g_cap_wfd = -1;
+    }
+
+    size_t cap = 8192, len = 0;
     char *buf = xmalloc(cap);
     for (;;) {
-        if (len + 1024 > cap) {
+        if (len + 4096 > cap) {
             cap *= 2;
             char *nb = realloc(buf, cap);
             if (!nb)
                 break;
             buf = nb;
         }
-        size_t n = fread(buf + len, 1, cap - len - 1, g_cap_file);
-        len += n;
+#if defined(_WIN32) || defined(_WIN64)
+        /* read through the stream: no _read() declaration needed */
+        size_t n = g_cap_file ? fread(buf + len, 1, cap - len - 1, g_cap_file) : 0;
         if (n == 0)
             break;
+        len += n;
+        continue;
+#else
+        ssize_t n = read(g_cap_rfd, buf + len, cap - len - 1);
+        if (n > 0) {
+            len += n;
+            continue;
+        }
+        if (n == 0)
+            break;
+        if (errno == EINTR)
+            continue;
+        break;
+#endif
     }
     buf[len] = 0;
-    fclose(g_cap_file);
-    g_cap_file = NULL;
+    close(g_cap_rfd);
+    g_cap_rfd = -1;
+    g_cap_active = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    if (g_cap_file) {
+        fclose(g_cap_file);
+        g_cap_file = NULL;
+    }
+    if (g_cap_path) {
+        remove(g_cap_path);
+        free(g_cap_path);
+        g_cap_path = NULL;
+    }
+#endif
     return buf;
+}
+
+/* Rejects a relative path that would escape its root: any ".." component, or
+ * an absolute path. Entry names in a cpio and "dest" values in a payload
+ * manifest are both supplied by other people, and veritpath's whole purpose is
+ * to process other people's images and payloads. */
+int vp_path_is_safe(const char *n)
+{
+    if (!n || !*n)
+        return 0;
+    if (*n == '/')
+        return 0;                 /* absolute: escapes any root we choose */
+    for (const char *p = n; *p;) {
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
+            return 0;
+        while (*p && *p != '/')
+            p++;
+        if (*p == '/')
+            p++;
+    }
+    return 1;
 }

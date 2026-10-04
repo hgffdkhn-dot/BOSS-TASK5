@@ -83,14 +83,13 @@ fun PatchScreen(vm: PatchViewModel) {
         }
 
         SectionCard("1 · 镜像") {
-            // 分区类型必须由用户选。CLI 的 TARGET 只是回显传入的 role，
-            // 不是真正的分区判别，所以自动识别做不到——
-            // 而选错的后果是产出一个要刷到错误分区的镜像。
+            // 默认 auto：上游 0.2.0 已能按镜像内容识别分区（magic + 有 ramdisk
+            // 无 kernel → init_boot）。手选项只在识别不出来时兜底。
             Text("分区类型", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(4.dp))
-            Row(Modifier.fillMaxWidth()) {
-                listOf("init_boot", "boot", "vendor_boot").forEach { r ->
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+                listOf("auto", "init_boot", "boot", "vendor_boot").forEach { r ->
                     FilterChip(
                         selected = role == r,
                         onClick = { vm.setRole(r) },
@@ -153,6 +152,14 @@ fun PatchScreen(vm: PatchViewModel) {
                 enabled = !busy && imagePath != null && payloadDir != null,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("修补镜像") }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "若源镜像是从手机 dd 出来的整个分区（100MB+），修补后体积会" +
+                    "小于源文件——那是分区尾部的填充。已默认保留，" +
+                    "大小会更接近原文件；功能上两者都能刷。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             if (patched.isNotEmpty()) {
                 Spacer(Modifier.height(8.dp))

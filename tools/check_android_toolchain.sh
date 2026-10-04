@@ -329,17 +329,56 @@ else
     vpv=$(grep -hoE 'VP_VERSION "[0-9.]+"' "$VP_DIR"/src/vp.h 2>/dev/null | head -1)
     echo "  ->   上游版本：${vpv:-未读到}（上游更新后这里的数字会变，可作为漂移信号）"
 
-    # ④ stderr 捕获补丁还在吗？
-    #    上游 vp_capture_start 只重定向 stdout，而 veritpath 的错误全部走
-    #    vp_err() → stderr。不打补丁的话 JNI 侧拿到的是"退出码 1 + 空输出"，
-    #    界面上表现为"修补失败，输出无"，一句原因都没有。
-    #    上游同步会覆盖 util.c，这个标记丢了就悄悄退化——必须显式检查。
+    # ④ 输出捕获：上游第三次改成了 **pipe 排空到内存**，不碰文件系统。
+    #    所以既不需要 BOSS-PATCH，也不再依赖任何可写目录。
+    #    （历史：stdout-only → mkstemp 找目录 → pipe。三次现象一样、根因不同。）
     if grep -q 'BOSS-PATCH' "$VP_DIR"/src/util.c 2>/dev/null; then
-        ok "stderr 捕获补丁还在（util.c 有 BOSS-PATCH 标记）"
+        bad "util.c 里还留着 BOSS-PATCH —— 上游已自带捕获，请删掉本地补丁"
+        echo "          留着会和上游的 dup2 抢同一个 fd，反而把输出搞乱。"
+    elif grep -q 'pipe(fds)' "$VP_DIR"/src/util.c 2>/dev/null; then
+        ok "捕获已用 pipe（不依赖可写目录），无需本地补丁"
+        if grep -q 'g_saved_err' "$VP_DIR"/src/util.c 2>/dev/null; then
+            ok "stderr 也在捕获范围内"
+        else
+            bad "只捕获了 stdout —— 失败时输出会为空"
+        fi
+    elif grep -q 'g_saved_err' "$VP_DIR"/src/util.c 2>/dev/null; then
+        warn "捕获走文件而非 pipe（上游旧版）——确认 setTempDir 已接上"
     else
-        bad "util.c 里没有 BOSS-PATCH —— stderr 捕获被覆盖掉了"
-        echo "          后果：失败时输出为空，界面只剩'退出码 1'。重打补丁见"
-        echo "          docs/TASK7-veritpath对接.md 第 3 节 ④"
+        bad "util.c 里既没有 pipe 也没有 g_saved_err —— 输出捕获有问题"
+        echo "          后果：失败时输出为空，界面只剩'退出码 N'。"
+    fi
+
+    # ⑤ setTempDir：现在**可选**。上游换 pipe 后 Java 注释明说
+    #   "You do not need this on Android or Linux"。
+    #   留着无害（只在 pipe() 都失败时才用的兜底），没有也不是错。
+    if grep -rq 'setTempDir' "$ROOT"/app/src/main/java/com/boss/manager/ 2>/dev/null; then
+        ok "已调用 Veritpath.setTempDir（现为可选兜底，无害）"
+    else
+        echo "  ->   没调 setTempDir —— 上游用 pipe 后不需要，可忽略"
+    fi
+
+    # ⑥ argv[0] 守卫：上游已修好拼装顺序（head 在前）并在 run() 里加了
+    #    显式的"子命令必须在 args[0]"检查，native 侧也有对应诊断。
+    #    这里查守卫还在不在——它决定了这类错误是"说清楚的报错"
+    #    还是"unknown command"那种莫名其妙的失败。
+    if grep -q "sub-command must be args" "$VP_JAVA" 2>/dev/null; then
+        ok "上游 run() 有 argv[0] 守卫（拼装错了会明确报错）"
+    else
+        warn "上游 run() 缺 argv[0] 守卫 —— 拼装错了只会得到 unknown command"
+    fi
+
+    # ⑦ --keep-trailing 接上没有？
+    #    dd 出来的整分区镜像（100MB+）repack 后只剩真实内容（几十 MB），
+    #    用户会以为修补坏了。上游有这个 flag，但 Java 侧没做专门 API，
+    #    要靠 inject(...) 的 extraArgs 传——所以很容易漏接。
+    if grep -q 'keep.trailing' "$VP_DIR"/src/main.c 2>/dev/null; then
+        if grep -rq 'keep-trailing\|keepTrailing' "$ROOT"/app/src/main/java/com/boss/manager/ 2>/dev/null; then
+            ok "已对接 --keep-trailing（大镜像不会莫名变小）"
+        else
+            bad "上游有 --keep-trailing 但没接 —— dd 出来的大镜像修补后会骤降"
+            echo "          表现：100MB+ 进去、几十 MB 出来。不是 bug，但不说明会让人以为坏了。"
+        fi
     fi
 fi
 

@@ -44,6 +44,11 @@ class PatchRepository(private val app: Context) {
     private val singleThread = Dispatchers.IO.limitedParallelism(1)
     private val lock = Mutex()
 
+    /* ⚠️ setTempDir 为什么必须调：见 serial() 里的说明。 */
+
+    @Volatile
+    private var prepared = false
+
     /** 缓存目录：copied 的输入与产出的镜像都放这里。 */
     private fun cacheDir(): File =
         File(app.cacheDir, "veritpath").apply { mkdirs() }
@@ -122,12 +127,58 @@ class PatchRepository(private val app: Context) {
 
     // ---- 下面是真正调 JNI 的地方，全部串行 + 后台线程 ----
 
-    private suspend fun run(vararg args: String): Veritpath.Result =
-        withContext(singleThread) {
-            lock.withLock {
-                Veritpath.run(*args)
+    /**
+     * 所有 JNI 调用的统一入口：串行 + 后台线程 + 首次前设好临时目录（可选）。
+     *
+     * ## 为什么仍然串行
+     * 上游用**进程级** stdout/stderr 重定向（dup2），并发调用会互相踩。
+     * 双重保险：单线程调度器 + Mutex。只加 Mutex 不够——
+     * 它只保证同一时刻一个协程，而 dup2 是进程级的。
+     *
+     * ## setTempDir：现在是**可选**的
+     *
+     * 上游第三次改（2026-09-29 同步）把捕获从文件换成了 **pipe 排空到内存**：
+     * 不碰文件系统、不需要任何可写目录。Java 侧注释已改成
+     * "You do not need this on Android or Linux"。
+     *
+     * 所以这里留着它只是**兜底**：只有在 `pipe()` 都创建失败的极端平台上，
+     * native 才会退回用这个目录 mkstemp。Android/Linux 上永远不会走到。
+     *
+     * > 历史（别照着旧经验查问题）：
+     * >  · 第一次：只捕获 stdout → 失败时输出为空
+     * >  · 第二次：换成 mkstemp 找临时目录 → Android 上 /tmp、/data/local/tmp、
+     * >    `.` 全都不可写 → 捕获静默失败，**输出同样为空**
+     * >  · 第三次（现在）：pipe，不依赖路径
+     * >
+     * > 三次的现象完全一样（退出码有、输出无），根因各不相同。
+     *
+     * ## 为什么放在这里而不是构造函数
+     * `setTempDir()` 内部会 `System.loadLibrary`。ViewModel 构造在主线程，
+     * 而 loadLibrary 失败抛的是 **Error（UnsatisfiedLinkError）不是 Exception**
+     * ——直接在主线程崩。挪到后台线程后由页面的 `catch (Throwable)` 接住，
+     * 变成一条提示。
+     */
+    private suspend fun <T> serial(block: () -> T): T = withContext(singleThread) {
+        lock.withLock {
+            if (!prepared) {
+                Veritpath.setTempDir(app.cacheDir.absolutePath)
+                prepared = true
             }
+            block()
         }
+    }
+
+    /**
+     * ⚠️ 输出有上限，超了会**静默截断**。
+     *    native 侧把 pipe 调到 1MiB（best effort）并设成非阻塞，
+     *    但直到 `vp_capture_stop()` 才排空——期间写入若超过缓冲区就返回 EAGAIN，
+     *    那部分内容直接丢了，不报错、不提示。
+     *
+     *    正常命令（plan / analyze --brief）几 KB 远够。
+     *    但 `--json` 或 `-v` 的冗长输出有风险。所以 UI 别默认开 verbose。
+     */
+    private suspend fun run(vararg args: String): Veritpath.Result =
+        serial { Veritpath.run(*args) }
 
     /** 分析镜像：`analyze --brief --boot <path>` */
     suspend fun analyze(imagePath: String): Veritpath.Result =
@@ -137,10 +188,15 @@ class PatchRepository(private val app: Context) {
     suspend fun analyzeWith(imagePath: String, flag: String): Veritpath.Result =
         run("analyze", "--brief", flag, imagePath)
 
-    /** 分析并取 JSON：`analyze --json --boot <path>` */
-    suspend fun analyzeJson(imagePath: String): String =
-        withContext(singleThread) {
-            lock.withLock { Veritpath.analyzeJson("--boot", imagePath) }
+    /** 分析并取 JSON。上游新签名收 Image 而不是裸字符串。 */
+    suspend fun analyzeJson(imagePath: String, role: String? = null): String =
+        serial {
+            val flag = if (role == null || role == "auto") null else roleFlag(role)
+            run(*buildList {
+                add("analyze"); add("--json")
+                flag?.let { add(it) }
+                add(imagePath)
+            }.toTypedArray()).output
         }
 
     /**
@@ -150,26 +206,7 @@ class PatchRepository(private val app: Context) {
     suspend fun payloadCheck(dir: String): Veritpath.Result =
         run("payload-check", dir)
 
-    /**
-     * 按给定分区角色分析一次，用来确认"这个镜像里到底有没有 ramdisk"。
-     *
-     * ⚠️ 关于 TARGET 的一个实测结论，很重要：
-     *    TARGET 字段**只是回显你传进去的 role**，不是真正的分区识别——
-     *      analyze --init-boot X  → TARGET:init_boot
-     *      analyze --boot 同一份 X → TARGET:boot
-     *    唯一有判断价值的是 **TARGET:none**（镜像里没有 ramdisk）。
-     *    所以"自动识别 boot 还是 init_boot"在这套 CLI 上做不到，
-     *    必须由用户指定——界面上就是那排分区选择。
-     *
-     * ⚠️ 另一个坑：**不要用上游的 `Veritpath.inject()`**。
-     *    它拼出的是 `inject <image> -p <dir> -o <out>`——镜像是裸位置参数，
-     *    而 CLI 的 load_images() 只认 --boot/--init-boot/--vendor-boot/--recovery，
-     *    位置参数被 getopt 直接忽略。后果：没有镜像被加载，退出码 1。
-     *    实测报错：`no input images given (use --boot/--init-boot/--vendor-boot)`
-     */
-    suspend fun probe(imagePath: String, role: String): Veritpath.Result =
-        run("analyze", "--brief", roleFlag(role), imagePath)
-
+    /** 分区角色 → CLI flag。 */
     fun roleFlag(role: String): String = when (role) {
         "init_boot" -> "--init-boot"
         "boot" -> "--boot"
@@ -178,30 +215,129 @@ class PatchRepository(private val app: Context) {
         else -> "--init-boot"
     }
 
-    /**
-     * 注入：`inject <--role> <image> -p <payloadDir> -o <outDir>`
+    /* ⚠️ 上游 0.2.0 已修掉"位置参数被忽略"这个 bug（main.c 新增 guess_role：
+     *    按 magic 区分 vendor_boot / boot，再用"无 kernel 但有 ramdisk"
+     *    判定 init_boot）。所以现在**可以用 Image.auto() 自动识别**了。
+     *    之前必须让用户手选分区，就是因为 TARGET 字段只是回显传入的 role。
      *
-     * @param role 由 detectRole() 得到的 ramdisk 所在分区；为 null 时
-     *             依次试 init_boot / boot（代价是两次解析，190MB 的镜像会慢一点）
+     *    实测（上游新 CLI，裸位置参数）：
+     *      init_boot.img    → rc=0，产出 init_boot.veritpath.img ✓
+     *      legacy1/legacy2  → rc=0 ✓
+     *      vendor_boot.img  → rc=0 ✓
+     *      boot.img         → rc=1 "nothing was patched"（它只有 kernel 无 ramdisk，
+     *                         这是**正确**行为，不是 bug）
+     */
+
+    /**
+     * 分析一次，用来确认"这个镜像里到底有没有 ramdisk"。
+     *
+     * @param role null/auto 时让 CLI 按内容识别
+     */
+    /* ================================================================
+     * ⚠️ 上游 Java 绑定的拼装 bug（**已实测确认**，不要再用 Veritpath.analyze/inject）
+     *
+     * 上游 Java 绑定里（Veritpath 那个类）：
+     *     String[] head = {"inject", "-p", payload, "-o", out};
+     *     return run(concat(withFlags(image), head, extraArgs));
+     *
+     * concat(first=withFlags, second=head) 把镜像 flag 排在了子命令**前面**，
+     * 拼出来是：
+     *     ["--init-boot", "/path", "inject", "-p", pay, "-o", out]
+     *
+     * 而 native 的 vp_cli_run() 取 **argv[0]** 当子命令，于是：
+     *     JNI 侧  → "veritpath: unknown command: --init-boot"，退出码 1
+     *     CLI 侧  → GNU getopt 会重排参数，实际跑成了 unpack（更隐蔽！）
+     *
+     * 实测（同一个 harness）：
+     *     [上游拼法] rc=1  → unknown command: --init-boot
+     *     [正确拼法] rc=0  → 正常产出镜像
+     *
+     * 所以上游那三个辅助方法**全都不能用**。
+     * 上游的 tools/test_jni.sh 测不到这个 bug——它用自己的 harness
+     * 直接传 ["analyze","--brief","--boot",img]，绕过了 Java 的拼装。
+     *
+     * 本文件所有调用都改成自拼 argv：**子命令固定放 argv[0]**。
+     * ================================================================ */
+
+    suspend fun probe(imagePath: String, role: String? = null): Veritpath.Result =
+        // 同样自己拼：上游那几个辅助方法的拼装顺序是错的（见下）。
+        serial {
+            val flag = if (role == null || role == "auto") null else roleFlag(role)
+            run(*buildList {
+                add("analyze"); add("--brief")
+                flag?.let { add(it) }
+                add(imagePath)
+            }.toTypedArray())
+        }
+
+    /**
+     * 注入。默认用 `Image.auto()` 让 CLI 自己识别分区类型。
+     *
+     * ⚠️ **不要用裸字符串当镜像路径**——上游新 API 已经把这点做成类型安全了
+     *    （`Veritpath.Image` 必须由工厂方法构造，flag 不会漏）。
      */
     suspend fun inject(
         imagePath: String,
         payloadDir: String,
         outDir: String,
         role: String? = null,
-    ): Veritpath.Result = withContext(singleThread) {
-        lock.withLock {
-            if (role != null) {
-                Veritpath.run("inject", roleFlag(role), imagePath,
-                    "-p", payloadDir, "-o", outDir)
-            } else {
-                val a = Veritpath.run("inject", "--init-boot", imagePath,
-                    "-p", payloadDir, "-o", outDir)
-                if (a.ok()) a
-                else Veritpath.run("inject", "--boot", imagePath,
-                    "-p", payloadDir, "-o", outDir)
-            }
-        }
+    ): Veritpath.Result = serial {
+        run(*injectArgs(imagePath, payloadDir, outDir, role, false))
+    }
+
+    /**
+     * 拼 inject 的 argv。**子命令必须在 argv[0]**。
+     *
+     * ⚠️ 为什么不用上游那个 inject 辅助方法：见下面
+     *    [上游 Java 绑定的拼装 bug]，它拼出来的顺序根本执行不了。
+     */
+    private fun injectArgs(
+        imagePath: String,
+        payloadDir: String,
+        outDir: String,
+        role: String?,
+        keepTrailing: Boolean,
+    ): Array<String> {
+        val flag = if (role == null || role == "auto") null else roleFlag(role)
+        return buildList {
+            add("inject")
+            flag?.let { add(it) }
+            add(imagePath)
+            add("-p"); add(payloadDir)
+            add("-o"); add(outDir)
+            if (keepTrailing) add("--keep-trailing")
+        }.toTypedArray()
+    }
+
+    /**
+     * 注入，**保留尾部填充**（`--keep-trailing`）。
+     *
+     * ## 现象
+     * 从手机 `dd` 出来的镜像是整个分区（常见 100MB+），而真正的内容只有几十 MB，
+     * 剩下的都是分区尾部的填充。repack 时这些东西会被丢掉——
+     * 于是"一百多 MB 进去、42MB 出来"。
+     *
+     * 实测（8KB 镜像 + 3MB 填充）：
+     *   不加 --keep-trailing → 8192 字节
+     *   加   --keep-trailing → 3008192 字节（原样保留）
+     *
+     * ## 要不要保留
+     * **默认保留。** 丢掉填充功能上通常没事（刷进去照样能开机，
+     * 因为 fastboot 只写镜像声明的长度），但保真更稳：
+     *   · 尾部万一不是纯零（OEM 数据、另一个槽的残留），丢了不可逆
+     *   · 用户看到体积骤降会以为修补坏了，本身就是个信任问题
+     * 代价只是文件大一点。
+     *
+     * ⚠️ 上游 Java 侧没给这个选项做专门 API（`Veritpath` 里没有 keepTrailing），
+     *    但 `inject(Image, dir, out, extraArgs...)` 收可变参数，可以传 flag。
+     */
+    suspend fun injectKeepTrailing(
+        imagePath: String,
+        payloadDir: String,
+        outDir: String,
+        role: String? = null,
+    ): Veritpath.Result = serial {
+        run(*injectArgs(imagePath, payloadDir, outDir, role, true))
     }
 
     /** 刷之前自检：`verify <image>` */
@@ -213,9 +349,7 @@ class PatchRepository(private val app: Context) {
         run("hexdump", imagePath)
 
     /** 库版本，用来确认 .so 真的加载了（不是空壳）。 */
-    suspend fun version(): String = withContext(singleThread) {
-        lock.withLock { Veritpath.version() }
-    }
+    suspend fun version(): String = serial { Veritpath.version() }
 
     suspend fun clearCache() = withContext(Dispatchers.IO) {
         cacheDir().deleteRecursively()

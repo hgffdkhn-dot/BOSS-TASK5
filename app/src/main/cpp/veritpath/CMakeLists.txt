@@ -15,12 +15,20 @@ set(CMAKE_C_STANDARD 11)
 
 file(GLOB VP_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c)
 
+# vp.h 之外上游新增了 compat.h（跨平台的 mkstemp/pipe 之类）。
+# 用 GLOB 兜住整个 include 目录，免得上游再加头文件时忘了同步进来——
+# 漏一个头文件的后果是编译期找不到声明，而且报错指向的是 .c 文件，
+# 很容易误判成"源码没拷全"。
+file(GLOB VP_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.h)
+
 # VP_NO_MAIN 必须定义：否则 CLI 的 main() 会被链进 .so。
 # 少了它不会报错，只是 .so 里多一个 main 符号——
 # 而真正暴露问题是运行时：Java 侧以为在调库，实际行为很怪且查不出来。
 add_library(veritpath SHARED ${VP_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/veritpath_jni.c)
 target_compile_definitions(veritpath PRIVATE VP_NO_MAIN)
 target_include_directories(veritpath PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# 让 IDE / 构建系统知道这些头，纯粹为了增量编译正确
+target_sources(veritpath PRIVATE ${VP_HEADERS})
 target_compile_options(veritpath PRIVATE -Wall -Wextra -O2)
 
 # zlib：BOOT 镜像的 ramdisk 段可能是 gzip 压缩的，解包要用。

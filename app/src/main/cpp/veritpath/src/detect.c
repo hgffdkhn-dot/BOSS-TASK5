@@ -9,6 +9,7 @@
 #endif
 
 /* Architecture / layout detection. */
+#include "compat.h"
 #include "vp.h"
 
 #include <stdlib.h>
@@ -237,8 +238,25 @@ void detect_analyze(image_set_t *set, size_t n, analysis_t *res)
         target = vendor;
         snprintf(res->layout, sizeof(res->layout), "vendor_boot");
         snprintf(res->target, sizeof(res->target), "vendor_boot");
+    } else if (boot && boot->kernel.len) {
+        /* nothing anywhere has a ramdisk - a system-as-root device that boots
+         * /system/bin/init directly. Patching it means creating one. */
+        target = boot;
+        snprintf(res->layout, sizeof(res->layout), "no_ramdisk");
+        snprintf(res->target, sizeof(res->target), "boot");
+        res->needs_ramdisk = 1;
     }
     res->target_img = target;
+
+    /* files larger than the image they contain are whole-partition dumps */
+    for (size_t i = 0; i < n && res->n_trailing < VP_MAX_IMAGES; i++) {
+        size_t tr = boot_img_trailing(set[i].img);
+        if (!tr)
+            continue;
+        res->trailing[res->n_trailing] = tr;
+        res->trailing_role[res->n_trailing] = set[i].role;
+        res->n_trailing++;
+    }
 
     res->gki = (init_boot != NULL) ||
                (boot && boot->header_version >= 3 && !boot->ramdisk.len);
@@ -284,6 +302,11 @@ static const char *layout_advice(const char *layout)
     if (strcmp(layout, "boot") == 0)
         return "Ramdisk lives inside this image. Patch it directly; kernel and "
                "DTB stay untouched.";
+    if (strcmp(layout, "no_ramdisk") == 0)
+        return "No ramdisk anywhere: a system-as-root device whose kernel boots "
+               "/system/bin/init directly. Either supply init_boot.img / "
+               "vendor_boot.img if this is really a GKI device, or create a "
+               "ramdisk with --create-ramdisk.";
     return "No ramdisk found. Supply init_boot.img (Android 13+) or a boot.img "
            "that actually contains one.";
 }
@@ -517,6 +540,8 @@ static void print_rich(analysis_t *res)
                                  res->target_img->ramdisk.len)));
     kv("ramdisk_segments", ri.segments);
     kv_bool("already_patched", res->already_patched);
+    if (res->needs_ramdisk)
+        kv_bool("needs_ramdisk", 1);
 
     if (res->boot || res->init_boot || res->vendor_boot) {
         print_rule('-');
@@ -573,6 +598,20 @@ static void print_rich(analysis_t *res)
              "(--force to re-inject)");
     if (strcmp(res->arch, "unknown") == 0)
         puts("  \xc2\xb7 arch unknown: init_boot.img has no kernel, supply boot.img too");
+    for (int i = 0; i < res->n_trailing; i++) {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "  \xc2\xb7 %s: the file holds %s that is not part of the boot "
+                 "image - a whole-partition dump (dd of /dev/block/by-name/...). "
+                 "That padding is dropped when repacking, so the output is "
+                 "smaller than the input. This is correct, not data loss.",
+                 res->trailing_role[i], human_size(res->trailing[i]));
+        puts(msg);
+    }
+    if (res->needs_ramdisk)
+        puts("  \xc2\xb7 No ramdisk exists yet - inject --create-ramdisk will "
+             "build one (directories, init.rc, file_contexts) and then apply the "
+             "payload into it.");
     if (res->slot[0])
         printf("  \xc2\xb7 A/B slot: %s\n", res->slot);
 
@@ -592,7 +631,15 @@ void detect_print(analysis_t *res, int mode)
         printf("  \"system_as_root\": %s,\n", res->system_as_root ? "true" : "false");
         printf("  \"gki\": %s,\n", res->gki ? "true" : "false");
         printf("  \"already_patched\": %s,\n", res->already_patched ? "true" : "false");
-        printf("  \"ramdisk_segments\": %d\n", res->n_segments);
+        printf("  \"ramdisk_segments\": %d,\n", res->n_segments);
+        if (res->n_trailing) {
+            printf("  \"trailing\": {");
+            for (int i = 0; i < res->n_trailing; i++)
+                printf("%s\"%s\": %zu", i ? ", " : "",
+                       res->trailing_role[i], res->trailing[i]);
+            printf("},\n");
+        }
+        printf("  \"needs_ramdisk\": %s\n", res->needs_ramdisk ? "true" : "false");
         printf("}\n");
         return;
     }
@@ -612,6 +659,10 @@ void detect_print(analysis_t *res, int mode)
         printf("SEGMENTS:%d\n", res->n_segments);
         printf("PATCHED:%s\n", yesno(res->already_patched));
         printf("TARGET:%s\n", res->target[0] ? res->target : "none");
+        if (res->needs_ramdisk)
+            puts("NEEDS_RAMDISK:1");
+        for (int i = 0; i < res->n_trailing; i++)
+            printf("TRAILING.%s:%zu\n", res->trailing_role[i], res->trailing[i]);
         if (res->has_vendor_boot && strcmp(res->target, "vendor_boot") != 0)
             puts("OPTIONAL:vendor_boot");
         return;

@@ -58,15 +58,49 @@ void *vp_memmem(const void *hay, size_t haylen, const void *needle, size_t needl
 char *path_join(const char *a, const char *b);
 char *path_dirname(const char *path);
 int dir_in_path(const char *dir, const char *path);
+int vp_path_is_safe(const char *rel);   /* no "..", not absolute */
 
 /* run the CLI without process exit: for embedders (JNI, tests, other tools) */
 void vp_set_program_name(const char *name);
 int vp_cli_run(int argc, char **argv);
 
-/* capture what vp_cli_run prints, as a malloc'd string */
+/* Capture what vp_cli_run prints (stdout *and* stderr) as a malloc'd string.
+ * The capture is a pipe drained into memory: no filesystem, no permissions, so
+ * it works in an app process that has no writable directory at all.
+ * vp_capture_set_dir() is only a last-resort fallback for platforms where
+ * pipe() is unavailable; normal callers never need it. */
+void vp_capture_set_dir(const char *dir);
+const char *vp_capture_error(void);
 int vp_capture_start(void);
 char *vp_capture_stop(void);
 char *replace_suffix(const char *path, const char *suffix); /* stem + suffix */
+
+/* ----------------------------------------------------- platform shims
+ *
+ * MinGW is not POSIX. Four things are missing or different and each one was a
+ * real build failure on Windows:
+ *   mkdir()  - takes one argument only
+ *   S_ISLNK  - not declared (no symlinks in the Windows model)
+ *   memmem   - not provided by the CRT at all
+ *   realpath - not provided
+ * Add the missing pieces here so the rest of the sources stay plain POSIX.
+ */
+#if defined(_WIN32) || defined(_WIN64)
+#include <sys/stat.h>
+#ifndef S_ISLNK
+#define S_ISLNK(m) (0)          /* Windows has no symlinks in this sense */
+#endif
+#define VP_NO_REALPATH 1
+/* MinGW's mkdir() is deprecated (and a macro on some toolchains); _mkdir is
+ * the documented one-argument form. */
+#include <direct.h>
+static inline int vp_mkdir_one(const char *p)
+{
+    return _mkdir(p);
+}
+#else
+#define vp_mkdir_one(p) mkdir((p), 0755)
+#endif
 
 /* ---------------------------------------------------------- compression */
 
@@ -83,7 +117,8 @@ typedef enum {
 
 comp_fmt_t comp_detect(const uint8_t *data, size_t len);
 const char *comp_name(comp_fmt_t f);
-comp_fmt_t comp_from_name(const char *name);
+comp_fmt_t comp_from_name(const char *name);   /* -1 if unknown */
+const char *comp_known_names(void);   /* list for --format error messages */
 int comp_decompress(const uint8_t *in, size_t inlen, buf_t *out);
 int comp_compress(const uint8_t *in, size_t inlen, comp_fmt_t fmt, buf_t *out);
 /* decompress one chunk, tell how many input bytes it used */
@@ -141,6 +176,13 @@ void cpio_entry_free(cpio_entry_t *e);
 size_t cpio_main_segment(cpio_archive_t *a);
 int cpio_extract_dir(cpio_archive_t *a, const char *root);
 int cpio_build_dir(const char *root, cpio_archive_t *a);
+int cpio_create_skeleton(cpio_archive_t *a);
+int cpio_has_placeholder_init(cpio_archive_t *a);
+
+/* Android boot image magic: "ANDROID!" for boot/init_boot/recovery,
+ * "VNDRBOOT" for vendor_boot. */
+#define BOOT_MAGIC "ANDROID!"
+#define VENDOR_MAGIC "VNDRBOOT"
 
 /* -------------------------------------------------------------- boot img */
 
@@ -155,7 +197,13 @@ typedef struct {
 } vendor_fragment_t;
 
 typedef struct {
-    int is_vendor;                  /* vendor_boot.img */
+    int is_vendor;
+    /* Bytes after the last payload the header describes. A whole-partition
+     * `dd` (dd if=/dev/block/by-name/boot_a) is mostly zeros past the real
+     * image, and repacking drops them - which looks alarming ("192MB became
+     * 42MB") if nobody says so. */
+    size_t trailing;
+    buf_t trailing_data;            /* kept only when non-empty */                  /* vendor_boot.img */
     char role[16];                  /* boot / init_boot / vendor_boot ... */
     const char *path;               /* source file (not owned) */
     uint32_t header_version;
@@ -178,16 +226,21 @@ typedef struct {
     size_t n_chunks;
 } boot_img_t;
 
+/* header-version detection, also useful for diagnostics */
+uint32_t vp_detect_header_version(const uint8_t *d, size_t len, const char *path);
+
 void boot_img_init(boot_img_t *img);
 void boot_img_free(boot_img_t *img);
 int boot_img_parse(const uint8_t *data, size_t len, const char *role,
                    const char *path, boot_img_t *img);
 int boot_img_pack(boot_img_t *img, buf_t *out);
+int boot_img_pack_ex(boot_img_t *img, buf_t *out, int keep_trailing);
 const char *boot_img_cmdline(boot_img_t *img);
 int boot_img_append_cmdline(boot_img_t *img, const char *extra);
 int boot_img_ramdisk_archive(boot_img_t *img, cpio_archive_t *a);
 int boot_img_set_ramdisk(boot_img_t *img, cpio_archive_t *a, int force);
 int boot_img_has_ramdisk(boot_img_t *img);
+size_t boot_img_trailing(const boot_img_t *img);
 buf_t *boot_img_dtb(boot_img_t *img);   /* may be NULL */
 
 /* ------------------------------------------------------------- detection */
@@ -204,6 +257,11 @@ typedef struct {
     int n_segments;
     int has_vendor_boot;
     int recovery_fragment;
+    int needs_ramdisk;                /* no ramdisk anywhere: one must be created */
+    /* bytes of padding after the image (whole-partition dumps) */
+    size_t trailing[VP_MAX_IMAGES];
+    const char *trailing_role[VP_MAX_IMAGES];
+    int n_trailing;
     char slot[8];
     const boot_img_t *target_img;
     const boot_img_t *boot;
@@ -317,6 +375,8 @@ typedef struct {
     int no_backup;
     int segment;                    /* -1 = auto */
     int ramdisk_format;             /* -1 = keep, else comp_fmt_t */
+    int create_ramdisk;              /* build a ramdisk when none exists */
+    int keep_trailing;               /* carry trailing bytes over to the output */
     const char *cmdline;
     const char *output;
 } options_t;

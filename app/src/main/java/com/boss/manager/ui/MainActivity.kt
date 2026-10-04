@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.InstallMobile
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -36,6 +37,7 @@ class MainActivity : ComponentActivity() {
     // 修补页单独一个 ViewModel：它需要 Context（SAF 拷文件要用缓存目录），
     // 而且管的是"还没装/OTA 掉了"这条完全不同的生命周期。
     private val patchVm: PatchViewModel by viewModels()
+    private val localVm: LocalInstallViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Android 16（API 36）起 edge-to-edge 是强制的，旧的 opt-out 会被忽略。
@@ -87,6 +89,7 @@ class MainActivity : ComponentActivity() {
                             2 -> HideScreen(vm)
                             3 -> SuperuserScreen(vm)
                             4 -> PatchScreen(patchVm)
+                            5 -> LocalInstallScreen(localVm)
                         }
                     }
                 }
@@ -101,6 +104,7 @@ private enum class Tab(val label: String, val icon: ImageVector) {
     HIDE("隐藏", Icons.Default.VisibilityOff),
     SU("授权", Icons.Default.Security),
     PATCH("修补", Icons.Default.Build),
+    LOCAL("本机安装", Icons.Default.InstallMobile),
 }
 
 @Composable

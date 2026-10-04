@@ -1,5 +1,7 @@
 package com.boss.manager.data
 
+import com.boss.manager.core.RamdiskProbe
+
 /** BOSS 的整体装态。首页那一张卡就是它。 */
 data class BossStatus(
     val installed: Boolean,          // bossd 探活成功
@@ -10,6 +12,8 @@ data class BossStatus(
     val managerUid: Int?,            // App 自己被认定的 uid；null = 还没注册
     val moduleCount: Int,
     val bossMounts: Int,
+    /** 环境里有没有可操作的 ramdisk（boot 镜像里也算）。主界面据此显示"是/否"。 */
+    val ramdisk: RamdiskProbe.Found? = null,
 )
 
 /** 无修改系统逻辑（任务5 A 面）的自检结果。 */

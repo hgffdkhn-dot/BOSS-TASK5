@@ -1,5 +1,7 @@
 package com.boss.manager.data
 
+import com.boss.manager.core.RamdiskProbe
+
 import com.boss.manager.core.BossCli
 import com.boss.manager.core.BossIpc
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +39,9 @@ class BossRepository {
                 ?.groupValues?.get(1)?.toIntOrNull(),
             moduleCount = modules.size,
             bossMounts = sl.bossMounts,
+            // ramdisk 探测独立于 BOSS 是否运行：模拟器/虚拟机上 BOSS 没装，
+            // 但环境照样可能暴露 ramdisk —— 那正是"先在虚拟机里试"的用户要看的。
+            ramdisk = runCatching { RamdiskProbe.find() }.getOrNull(),
         )
     }
 

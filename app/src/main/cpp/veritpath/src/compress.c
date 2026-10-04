@@ -18,6 +18,7 @@
  *
  * Everything optional is guarded so a plain `cc *.c -lz` still builds.
  */
+#include "compat.h"
 #include "vp.h"
 
 #include <stdlib.h>
@@ -66,13 +67,18 @@ const char *comp_name(comp_fmt_t f)
     }
 }
 
+/* Returns -1 for an unknown name. It used to return FMT_RAW, which made
+ * "raw" and "typo" indistinguishable: --format nosuchfmt silently meant
+ * "no compression" and produced an image the bootloader could not read. */
 comp_fmt_t comp_from_name(const char *name)
 {
+    if (!name || !*name)
+        return (comp_fmt_t)-1;
     for (int i = 0; i <= (int)FMT_ZSTD; i++) {
         if (strcmp(name, comp_name((comp_fmt_t)i)) == 0)
             return (comp_fmt_t)i;
     }
-    return FMT_RAW;
+    return (comp_fmt_t)-1;
 }
 
 /* --------------------------------------------------------------- lz4 core */
@@ -496,4 +502,23 @@ int comp_split(const uint8_t *in, size_t inlen, comp_chunks_t *out)
         out->n = out->cap = 1;
     }
     return 0;
+}
+
+/* for error messages: which --format values are accepted */
+const char *comp_known_names(void)
+{
+    static char buf[256];
+    static const char *names[] = { "raw", "gzip", "xz", "lzma", "lz4",
+                                   "lz4_legacy", "bzip2", "zstd" };
+    size_t n = 0;
+    buf[0] = 0;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        int f = (int)comp_from_name(names[i]);
+        if (f < 0)
+            continue;                 /* backend not compiled in */
+        if (n)
+            n += (size_t)snprintf(buf + n, sizeof(buf) - n, " ");
+        n += (size_t)snprintf(buf + n, sizeof(buf) - n, "%s", names[i]);
+    }
+    return buf;
 }

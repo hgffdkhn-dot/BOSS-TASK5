@@ -9,6 +9,7 @@
 #endif
 
 /* Payload loading (manifest.json) and ramdisk injection. */
+#include "compat.h"
 #include "vp.h"
 
 #include <dirent.h>
@@ -275,6 +276,14 @@ int payload_load(const char *dir, payload_t *p)
         payload_file_t *f = &p->files[i];
         if (f->dest[0] != '/') {
             vp_err("payload file '%s': dest must be an absolute ramdisk path", f->src);
+            return -1;
+        }
+        /* the manifest comes from whoever wrote the payload, so the same
+         * traversal rule as for cpio entries applies to what is *inside* */
+        if (!vp_path_is_safe(f->dest + 1)) {
+            vp_err("payload file '%s': dest '%s' escapes the ramdisk root",
+                   f->src, f->dest);
+            return -1;
             return -1;
         }
         if (f->required) {
