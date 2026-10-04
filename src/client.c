@@ -19,8 +19,9 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: su [-c <command>] [-s <shell>] [-u <uid>] [-g <gid>]\n"
-        "          [-l|--login] [-p|--preserve-environment]\n"
-        "          [--context <selinux-domain>] [-V|--version]\n");
+        "          [-l|--login] [-p|-m|--preserve-environment]\n"
+        "          [-Z|--context <domain>] [-M|--mount-master]\n"
+        "          [-v|-V|--version] [-h|--help] [LOGIN] [args...]\n");
 }
 
 static void send_blob(int sock, const char *buf, size_t len)
@@ -40,6 +41,87 @@ int boss_send_handshake(int sock)
     return sv[0];
 }
 
+/* 安全地把一个 token 追加到命令缓冲区，返回新的 off（保证 <= cap）。
+ *
+ * 为什么需要单独一个函数：snprintf 返回的是"**本应**写入的长度"，不是实际
+ * 写入数。截断时它大于可用空间，于是
+ *     off += snprintf(cmd + off, sizeof(cmd) - off, ...)
+ * 会让 off 越过 cap；下一轮 sizeof(cmd) - off 是 size_t，无符号下溢成一个
+ * 巨大值，那一次的 snprintf 就变成了越界写（栈溢出）。
+ * 老应用会传 `su -c <很长的脚本>`，这条路径真的会被走到。
+ */
+static size_t cmd_append(char *buf, size_t cap, size_t off, const char *s)
+{
+    if (off >= cap) return off;                   /* 已满 */
+    if (off && off + 1 < cap) buf[off++] = ' ';   /* 参数之间补空格 */
+    size_t room = cap - off;
+    if (room == 0) return off;
+    int n = snprintf(buf + off, room, "%s", s);
+    if (n < 0) return off;                        /* 编码错误，就地停下 */
+    if ((size_t)n >= room) return cap;            /* 发生截断：直接标记满 */
+    return off + (size_t)n;
+}
+
+/* 常见账户名 → uid。老应用里 `su root -c ...` 这种写法并不少见，
+ * 而 Android 的 /etc/passwd 在早期阶段未必可读，查表比解析系统文件稳。 */
+static int name_to_uid(const char *s)
+{
+    if (!strcmp(s, "root"))   return 0;
+    if (!strcmp(s, "system")) return 1000;
+    if (!strcmp(s, "shell"))  return 2000;
+    return -1;
+}
+
+/* ------------------------------------------------------------------
+ * 向下兼容：协议版本协商
+ * ------------------------------------------------------------------
+ * 真机上 ramdisk 里的 boss 与 /data/adb/boss/boss 是两份二进制，版本会错开。
+ * 两种错开都要能活：
+ *   · 新客户端 → 老 daemon（只认 v1）：老 daemon 会回 BOSS_ERR。
+ *     我们按 v1 重发一次即可——v1/v2 的结构体布局一致，且本次请求没用到
+ *     v2 独有的能力（UI 通道），降级是安全的。
+ *   · 老客户端 → 新 daemon：由 daemon 侧放宽版本校验来接住（见 daemon.c）。
+ *
+ * 只重试"版本不被接受"这一种情况：BOSS_ERR 也可能是别的内部错误，
+ * 但重发一次无害（请求是幂等的），换来的是换包后不用手动对齐两份二进制。
+ * ------------------------------------------------------------------ */
+int boss_negotiate(struct boss_request *req, const char *env_blob,
+                   struct boss_response *rep, int *sock_out, int *ver_out)
+{
+    for (unsigned v = BOSS_PROTO_VER; v >= BOSS_PROTO_MIN; v--) {
+        req->version = v;
+
+        int sock = boss_connect();
+        if (sock < 0) return -1;
+
+        int status_sock = boss_send_handshake(sock);
+        if (boss_write_full(sock, req, sizeof(*req)) < 0) {
+            if (status_sock >= 0) close(status_sock);
+            close(sock);
+            return -1;
+        }
+        if (req->env_len) send_blob(sock, env_blob, req->env_len);
+
+        if (boss_read_full(sock, rep, sizeof(*rep)) < 0) {
+            if (status_sock >= 0) close(status_sock);
+            close(sock);
+            return -1;
+        }
+
+        /* 老 daemon 不接受这个版本：整条请求按下一个版本重来 */
+        if (rep->code == BOSS_ERR && v > BOSS_PROTO_MIN) {
+            if (status_sock >= 0) close(status_sock);
+            close(sock);
+            continue;
+        }
+
+        *sock_out = sock;
+        *ver_out = (int)v;
+        return status_sock;
+    }
+    return -1;
+}
+
 int boss_su_main(int argc, char **argv)
 {
     struct boss_request req;
@@ -49,20 +131,31 @@ int boss_su_main(int argc, char **argv)
     req.target_uid = 0;
     req.target_gid = 0;
 
-    /* -c 之后的全部内容拼成一条命令，避免被 shell 再切一次 */
     int i = 1;
     int cmd_mode = 0;
+    int uid_seen = 0;      /* 位置参数里的目标用户只认第一个 */
     char cmd[BOSS_MAX_CMD] = { 0 };
 
     for (; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "-V") || !strcmp(a, "--version")) {
-            printf("BOSS su 0.1.0 (proto v%d)\n", BOSS_PROTO_VER);
+        if (!strcmp(a, "-V") || !strcmp(a, "-v") || !strcmp(a, "--version")) {
+            /* Magisk 的 -v / -V 都是版本；老脚本两种都写，都认 */
+            printf("%s\n", BOSS_VERSION);
             return 0;
         } else if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
             usage();
             return 0;
         } else if (!strcmp(a, "-c") && i + 1 < argc) {
+            /* 向下兼容：`-c` 之后的所有内容拼成一条命令。
+             * 老应用常见 `su -c ls -l`（没加引号），Magisk 也是这么处理的——
+             * 只取第一个 token 会让这类调用静默执行错命令。 */
+            cmd_mode = 1;
+            i++;
+            size_t off = 0;
+            for (; i < argc; i++)
+                off = cmd_append(cmd, sizeof(cmd), off, argv[i]);
+            break;
+        } else if (!strcmp(a, "--command") && i + 1 < argc) {
             cmd_mode = 1;
             i++;
             boss_copy(cmd, sizeof(cmd), argv[i]);
@@ -75,18 +168,35 @@ int boss_su_main(int argc, char **argv)
         } else if (!strcmp(a, "-g") && i + 1 < argc) {
             i++;
             req.target_gid = (uint32_t)atoi(argv[i]);
-        } else if (!strcmp(a, "--context") && i + 1 < argc) {
-            i++;
-            boss_copy(req.context, sizeof(req.context), argv[i]);
+        } else if (!strcmp(a, "-Z") || !strcmp(a, "--context")) {
+            /* Magisk 的 -Z；也接受老写法 --context */
+            if (i + 1 < argc) { i++; boss_copy(req.context, sizeof(req.context), argv[i]); }
+        } else if (!strcmp(a, "-M") || !strcmp(a, "--mount-master")) {
+            /* Magisk 语义：在全局 mount namespace 里执行。
+             * bossd 由 init 拉起、本身就在全局 namespace，天然满足。
+             * 接受它（而不是报错或当未知参数丢掉），老应用才不会卡在这里。 */
+            req.flags |= BOSS_F_MOUNT_MASTER;
         } else if (!strcmp(a, "-l") || !strcmp(a, "--login") || !strcmp(a, "-")) {
             req.flags |= BOSS_F_LOGIN;
         } else if (!strcmp(a, "-p") || !strcmp(a, "--preserve-environment")) {
             req.flags |= BOSS_F_KEEPENV;
         } else if (!strcmp(a, "-mm") || !strcmp(a, "-m")) {
             req.flags |= BOSS_F_KEEPENV;
-        } else if (a[0] != '-') {
-            /* 目标用户名/参数：v1 忽略，留给 v2 的参数透传 */
+        } else if (a[0] != '-' && !uid_seen) {
+            /* 位置参数当目标用户：`su root -c ...`、`su 0 -c ...`（老脚本常见写法） */
+            char *end = NULL;
+            long n = strtol(a, &end, 10);
+            if (end && *end == '\0' && n >= 0) {
+                req.target_uid = (uint32_t)n;
+                uid_seen = 1;
+            } else {
+                int u = name_to_uid(a);
+                if (u >= 0) { req.target_uid = (uint32_t)u; uid_seen = 1; }
+            }
+            /* 认不出来就当普通参数忽略：宁可少解析一个，也不要把命令吃掉 */
         }
+        /* 其余未知选项一律忽略——老应用传的参数比我们实现的多，
+         * 报错会让它们判定"此设备无 root"，静默接受才是对的。 */
     }
     boss_copy(req.command, sizeof(req.command), cmd);
     (void)cmd_mode;
@@ -110,37 +220,26 @@ int boss_su_main(int argc, char **argv)
         req.env_len = (uint32_t)off;
     }
 
-    int sock = boss_connect();
-    if (sock < 0) {
+    int sock = -1, used_ver = (int)BOSS_PROTO_VER;
+    struct boss_response rep;
+    memset(&rep, 0, sizeof(rep));
+
+    int status_sock = boss_negotiate(&req, env_blob, &rep, &sock, &used_ver);
+    if (status_sock < 0 && sock < 0) {
         fprintf(stderr, "su: bossd 未运行或 BOSS 未安装\n");
         free(env_blob);
         return 1;
     }
-
-    /* side channel：让 daemon 能把子进程的退出码回传，
-     * 不占用主数据通道，避免退出码被当成输出打印出来。 */
-    int status_sock = boss_send_handshake(sock);
-
-    if (boss_write_full(sock, &req, sizeof(req)) < 0) {
+    if (sock < 0) {
         fprintf(stderr, "su: 与 bossd 通信失败\n");
-        close(sock);
         free(env_blob);
         return 1;
     }
-    if (req.env_len) send_blob(sock, env_blob, req.env_len);
 
-    struct boss_response rep;
-    memset(&rep, 0, sizeof(rep));
-    if (boss_read_full(sock, &rep, sizeof(rep)) < 0) {
-        fprintf(stderr, "su: 无响应\n");
-        close(sock);
-        free(env_blob);
-        return 1;
-    }
     if (rep.code != BOSS_OK) {
         const char *why = rep.code == BOSS_DENIED ? "策略拒绝" :
                           (rep.code == BOSS_PROMPT ? "等待 BOSS 前端授权" : "内部错误");
-        fprintf(stderr, "su: %s (uid=%u)\n", why, (unsigned)getuid());
+        fprintf(stderr, "su: %s (uid=%u, proto=v%d)\n", why, (unsigned)getuid(), used_ver);
         close(sock);
         free(env_blob);
         return 1;

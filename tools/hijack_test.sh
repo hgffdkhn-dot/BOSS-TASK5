@@ -38,14 +38,17 @@ echo "== 1. needs_root 契约：非 root 下必须明确报错，不能静默失
 if [ "$UID_NOW" -eq 0 ]; then
     skip "当前是 root，这一条要在非 root 下才验得到（CI 会验）"
 else
-    OUT=$($BIN init hijack-prep --dry 2>&1); RC=$?
+    # BOSS_LAYOUT=2si：沙盒里探测不到 2SI 迹象（没有 /first_stage_ramdisk，
+    # 也没有 /system/bin/init），不强制的话会走"老布局跳过"分支，
+    # 验不到真正的劫持计划。真机上 init 传下来的环境是空的，这个变量 inert。
+    OUT=$(BOSS_LAYOUT=2si $BIN init hijack-prep --dry 2>&1); RC=$?
     check "applet 层拒绝并返回非 0" "$RC" "1"
     echo "$OUT" | grep -q "需要 root" && ok "报错说清了原因" || bad "静默失败: $OUT"
 fi
 
 echo
 echo "== 2. dry run：说清打算做什么 =="
-OUT=$($KIT hijack-prep --dry 2>&1); RC=$?
+OUT=$(BOSS_LAYOUT=2si $KIT hijack-prep --dry 2>&1); RC=$?
 check "dry run 返回 0" "$RC" "0"
 echo "$OUT" | grep -q "would bind" && ok "说清了打算挂什么" || bad "输出不完整"
 echo "$OUT" | grep -q "/init.real" && ok "包含真实 init 备份这一步" || bad "缺 /init.real 备份说明"
@@ -59,7 +62,7 @@ B_LINK=0; B_REAL=0; B_SDCARD=0; B_SELF=0
 [ -e /init.real ] && B_REAL=1
 [ -e /sdcard ] && B_SDCARD=1
 [ -e /storage/self ] && B_SELF=1
-$KIT hijack-prep --dry >/dev/null 2>&1
+BOSS_LAYOUT=2si $KIT hijack-prep --dry >/dev/null 2>&1
 N_LINK=0; N_REAL=0; N_SDCARD=0; N_SELF=0
 [ -L /storage/self/primary ] && N_LINK=1
 [ -e /init.real ] && N_REAL=1
@@ -71,6 +74,12 @@ if [ "$B_LINK" != "$N_LINK" ] || [ "$B_REAL" != "$N_REAL" ] ||
 else
     ok "dry run 未产生任何新增副作用"
 fi
+
+echo
+echo "== 3b. 向下兼容：老布局（非 2SI）必须跳过劫持 =="
+OUT=$(BOSS_LAYOUT=legacy_root $KIT hijack-prep 2>&1); RC=$?
+check "跳过时返回 0（不拖住 init）" "$RC" "0"
+echo "$OUT" | grep -q "跳过" && ok "说清了跳过原因" || bad "没说明原因: $OUT"
 
 echo
 echo "== 4. 布置失败不能中断 init（这条决定开不开得了机）=="

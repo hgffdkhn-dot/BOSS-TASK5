@@ -372,6 +372,79 @@ static int cmd_stage2(int argc, char **argv)
  *   → 任务5 的 systemless 编排一次都不会执行。
  * 症状是"代码写完、单测全绿、真机无效果"，排查方向极易跑偏到挂载逻辑本身。
  */
+
+/* ------------------------------------------------------------------
+ * 向下兼容：运行时布局探测
+ * ------------------------------------------------------------------
+ * 三种布局，对策完全不同。判错方向有两种后果，都不好：
+ *   · 在 2SI 设备上不劫持 → ramdisk 切根后消失，BOSS 一次都不会被叫起来
+ *     （症状：代码全对、真机无效果）。
+ *   · 在**非 SAR 老设备**上劫持 → 那些机器根本不会去 exec /system/bin/init，
+ *     劫持无效，反而把 boss 二进制 bind 到 /sdcard 上遮住真正的内部存储——
+ *     老设备上 /sdcard 常常是真实目录，这一下用户的文件就"没了"。
+ *
+ * 所以先探测再动手，并给一条 cmdline 覆盖（boss_hijack=0/1）：
+ * 真机上判定错了不用重刷镜像就能纠正，和 boss_selinux=0 是同一条自救思路。
+ *
+ * 判定只用"运行时看得见"的事实：
+ *   · /first_stage_ramdisk 存在         → 2SI（Android 10+ 的 ramdisk 形态）
+ *   · /system/bin/init 可执行           → 有二阶段 init 可劫持
+ *     （early-init 时 /system 可能还没挂载，此时这条不可知，所以只作补充证据）
+ *   · /init 里含有 "/system/bin/init"   → 这个 init 会去 exec 第二阶段
+ */
+enum boss_layout { LAYOUT_UNKNOWN = 0, LAYOUT_LEGACY_ROOT, LAYOUT_TWO_STAGE };
+
+static int file_contains(const char *path, const char *needle)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char buf[65536];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    return memmem(buf, (size_t)n, needle, strlen(needle)) != NULL;
+}
+
+static enum boss_layout detect_layout(void)
+{
+    /* 显式覆盖优先。两条路各有用途：
+     *   BOSS_LAYOUT=2si|legacy_root  —— 离机测试用（和 BOSS_INIT_REAL 同一套路）。
+     *     真机上 init 传下来的环境是空的，这个变量不可能被意外带上，等于 inert。
+     *   cmdline 的 boss_hijack=0/1   —— 真机自救用。判定错了不用重刷镜像，
+     *     加一个 token 就能现场改方向（与 boss_selinux=0 同一条思路）。 */
+    const char *ov = getenv("BOSS_LAYOUT");
+    if (ov) {
+        if (!strcmp(ov, "2si") || !strcmp(ov, "twostage")) return LAYOUT_TWO_STAGE;
+        if (!strcmp(ov, "legacy_root") || !strcmp(ov, "legacy")) return LAYOUT_LEGACY_ROOT;
+    }
+    if (cmdline_says_off("boss_hijack=1")) return LAYOUT_TWO_STAGE;
+    if (cmdline_says_off("boss_hijack=0")) return LAYOUT_LEGACY_ROOT;
+
+    if (access("/first_stage_ramdisk", F_OK) == 0)        return LAYOUT_TWO_STAGE;
+    if (access("/system/bin/init", X_OK) == 0)            return LAYOUT_TWO_STAGE;
+    if (file_contains("/init", "/system/bin/init"))       return LAYOUT_TWO_STAGE;
+
+    /* 没有任何 2SI 迹象：按老布局处理（ramdisk 就是 /，rc 全程有效） */
+    return LAYOUT_LEGACY_ROOT;
+}
+
+/* boss init probe：把判定结果打出来。
+ * 真机第一件事应该是跑它——先确认自己在哪种布局上，再谈改代码。 */
+static int cmd_probe(void)
+{
+    enum boss_layout l = detect_layout();
+    printf("LAYOUT:%s\n", l == LAYOUT_TWO_STAGE ? "2si" :
+                          (l == LAYOUT_LEGACY_ROOT ? "legacy_root" : "unknown"));
+    printf("FIRST_STAGE_RAMDISK:%d\n", access("/first_stage_ramdisk", F_OK) == 0);
+    printf("SYSTEM_BIN_INIT:%d\n", access("/system/bin/init", X_OK) == 0);
+    printf("INIT_REFS_SECOND_STAGE:%d\n", file_contains("/init", "/system/bin/init"));
+    printf("HIJACK_NEEDED:%d\n", l == LAYOUT_TWO_STAGE);
+    printf("RAMDISK_RC_EFFECTIVE:%d\n", l == LAYOUT_LEGACY_ROOT);
+    printf("REAL_INIT:%s\n", real_init_path() ? real_init_path() : "(none)");
+    return 0;
+}
+
 static int cmd_hijack_prep(int argc, char **argv)
 {
     /* --dry：只打印将做什么，不真 mount。
@@ -380,6 +453,16 @@ static int cmd_hijack_prep(int argc, char **argv)
     int dry = 0;
     for (int i = 0; i < argc; i++) if (!strcmp(argv[i], "--dry")) dry = 1;
     int mounted = 0;
+
+    /* ---- 向下兼容：非 2SI 设备直接跳过 ----
+     * 老布局（ramdisk 就是 /）上 ramdisk 里的 rc 全程有效，根本不需要劫持；
+     * 而劫持在这里的副作用（bind 到 /sdcard）会盖住用户的内部存储。
+     * 所以判定为 legacy_root 时明确跳过，并留下 kmsg 说明原因。 */
+    if (detect_layout() != LAYOUT_TWO_STAGE) {
+        printf("hijack-prep: 非 2SI 布局，跳过（ramdisk 里的 rc 全程有效，无需劫持）\n");
+        kmsg_log("boss: hijack-prep 跳过：非 2SI 布局，ramdisk rc 有效\n");
+        return 0;
+    }
 
     /* dry run 下连符号链接都不铺：它本来的意义就是"看一眼打算做什么"，
      * 铺了就会在测试机上留下垃圾，反而让人分不清是 dry 留下的还是真跑的。 */
@@ -512,6 +595,9 @@ int boss_init_main(int argc, char **argv)
         return cmd_stage2(argc, argv);
     if (!strcmp(cmd, "hijack-prep") || !strcmp(cmd, "--hijack-prep"))
         return cmd_hijack_prep(argc - 1, argv + 1);
+    /* 向下兼容：上机第一件事就是跑它，先确认自己在哪种布局上 */
+    if (!strcmp(cmd, "probe") || !strcmp(cmd, "layout"))
+        return cmd_probe();
     if (!strcmp(cmd, "alive"))
         return daemon_alive() ? 0 : 1;
 

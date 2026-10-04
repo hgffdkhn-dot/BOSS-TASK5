@@ -102,7 +102,17 @@ check "--list 含 module" "$A" "1"
 
 echo "== 10. resetprop：造合成属性区并读取 =="
 PROPDIR=/tmp/boss-props
-rm -rf "$PROPDIR"
+# 与 TEST_DIR 同一条教训：清不掉就**明说**，别让后面 6 项莫名其妙地失败。
+# root 跑完留下这个目录，再以 nobody 跑就会 Permission denied，
+# 症状是 resetprop 整段返回空——看起来像"改坏了"，其实是读不到合成区。
+rm -rf "$PROPDIR" 2>/dev/null
+if [ -e "$PROPDIR" ]; then
+    if [ "$UID_NOW" -ne 0 ] && command -v sudo >/dev/null 2>&1; then sudo rm -rf "$PROPDIR" 2>/dev/null; fi
+fi
+if [ -e "$PROPDIR" ]; then
+    echo "ERROR: 无法清理 $PROPDIR（多半属于其他用户）：rm -rf $PROPDIR 后重试" >&2
+    exit 1
+fi
 python3 tools/mkprop.py "$PROPDIR" ro.debuggable=0 ro.secure=1 persist.demo=hello >/dev/null 2>&1
 if [ -d "$PROPDIR" ]; then ok "mkprop 已生成合成属性区"; else bad "mkprop 失败"; fi
 OUT=$($BIN resetprop --dir "$PROPDIR" ro.debuggable 2>/dev/null)
@@ -127,8 +137,11 @@ OUT=$("$TEST_DIR/bin/resetprop" --dir "$PROPDIR" ro.debuggable 2>/dev/null)
 check "symlink 调用行为一致" "$OUT" "[ro.debuggable]: [1]"
 
 echo "== 12. resetprop：--file 批量导入（模块 system.prop 用）=="
-printf '# comment\nro.from.file = 1\npersist.from.file = yes\n' > /tmp/boss-test.prop
-$BIN resetprop -n --dir "$PROPDIR" --file /tmp/boss-test.prop >/dev/null 2>&1
+# 写在 TEST_DIR 里而不是 /tmp/boss-test.prop：后者是全局路径，
+# root 跑过一次之后 nobody 会 Permission denied（write 失败 → 读到空）。
+PROPFILE="$TEST_DIR/fromfile.prop"
+printf '# comment\nro.from.file = 1\npersist.from.file = yes\n' > "$PROPFILE"
+$BIN resetprop -n --dir "$PROPDIR" --file "$PROPFILE" >/dev/null 2>&1
 OUT=$($BIN resetprop --dir "$PROPDIR" ro.from.file 2>/dev/null)
 check "批量导入（键名带空格也应生效）" "$OUT" "[ro.from.file]: [1]"
 

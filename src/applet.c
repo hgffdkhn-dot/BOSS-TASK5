@@ -181,23 +181,25 @@ static int cmd_init(int argc, char **argv)
 static int cmd_ping(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    int fd = boss_connect();
-    if (fd < 0) { printf("bossd: down\n"); return 1; }
-    int status_sock = boss_send_handshake(fd);
+    /* 向下兼容：探活也要走版本协商。
+     * 对端是只认 v1 的老 daemon 时，直接发 v2 会被拒——表现为
+     * "bossd 明明在跑，ping 却说 down"，真机上会误导排障方向。 */
     struct boss_request req;
     memset(&req, 0, sizeof(req));
     req.magic = BOSS_MAGIC;
-    req.version = BOSS_PROTO_VER;
     req.flags = BOSS_F_PING;
+
+    int fd = -1, used_ver = (int)BOSS_PROTO_VER;
     struct boss_response rep;
     memset(&rep, 0, sizeof(rep));
-    int ok = 0;
-    if (boss_write_full(fd, &req, sizeof(req)) == 0 &&
-        boss_read_full(fd, &rep, sizeof(rep)) == 0)
-        ok = (rep.code == BOSS_OK);
+
+    int status_sock = boss_negotiate(&req, NULL, &rep, &fd, &used_ver);
+    if (fd < 0) { printf("bossd: down\n"); return 1; }
+
+    int ok = (rep.code == BOSS_OK);
     if (status_sock >= 0) close(status_sock);
     close(fd);
-    printf("bossd: %s (proto v%d)\n", ok ? "up" : "error", BOSS_PROTO_VER);
+    printf("bossd: %s (proto v%d)\n", ok ? "up" : "error", used_ver);
     return ok ? 0 : 1;
 }
 

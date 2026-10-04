@@ -31,6 +31,8 @@ Magisk 式 root 管理器 BOSS 的 su 子系统与关键组件：主打**隐蔽�
 - **任务6（客户端）接手先看**：`docs/HANDOFF-TASK6-客户端.md`（操作手册：
   三条硬约束、接口契约、别做错的事）
 - 任务5 的**交付说明**：`docs/TASK5-无修改系统逻辑与特典逻辑.md`（设计推演）
+- **向下兼容（su 与 init）**：`docs/TASK-向下兼容-su与init.md`
+  （rc 语法下限 / 布局探测 / 协议双向兼容；老设备上劫持必须跳过）
 - 方案解析与设计说明：`docs/BOSS-su-方案解析与设计.md`
 - **接力开发者先看**：`docs/HANDOFF-接力须知.md`（踩过的坑、架构红线、v0.2 实施手册）
 - 任务3（关键组件）的**任务书**：`docs/HANDOFF-TASK3-关键组件.md`
@@ -71,8 +73,9 @@ docs/       方案解析与设计、HANDOFF 接力须知、TASK3 交付说明、
 
 两组工作流：
 
-- `ci.yml`（4 个 job）：冒烟端到端（28 项）、多 `-std` `-Werror` 严格编译、
-  payload 用 veritpath 实际注入校验、Android 四 ABI 交叉编译 + Bionic 加载校验
+- `ci.yml`（5 个 job）：冒烟端到端（28 项）、**向下兼容（28 项）**、
+  多 `-std` `-Werror` 严格编译、payload 用 veritpath 实际注入校验、
+  Android 四 ABI 交叉编译 + Bionic 加载校验
 - `components.yml`（2 个 job）：任务3 组件的**深度验收** + 属性区布局断言自检
 - `task5.yml`（2 个 job）：任务5 三套验收（systemless 16 / hide 17 / hijack 9）
   + 挂载解析"只有一份"的自检
@@ -81,6 +84,7 @@ docs/       方案解析与设计、HANDOFF 接力须知、TASK3 交付说明、
 
 ```bash
 bash tools/smoke_test.sh        # 端到端主链路，28 项
+bash tools/compat_test.sh       # 向下兼容：rc 语法下限 / 布局探测 / 协议与命令行（28 项）
 bash tools/component_test.sh    # 任务3 边界与语义细节（root 与非 root 都过）
 bash tools/systemless_test.sh   # 任务5 A 面：无修改系统逻辑
 bash tools/hide_test.sh         # 任务5 B 面：特典逻辑
@@ -236,6 +240,22 @@ boss ping                       探活
 | 6. BOSS 客户端与对接修补 | ✅ 已交付（App + manager 身份 + 授权弹窗；真机待验）|
 | 7. veritpath App 侧对接 | ✅ 已对接（JNI 库 + 修补页；NDK 编译与真机待验）|
 | 7. 长期开发 | ⬜ |
+
+## 向下兼容（老设备）
+
+上机**第一件事**是 `boss init probe`，不是改代码：
+
+```
+LAYOUT:2si            → 需要劫持，ramdisk 里的 rc 切根后消失
+LAYOUT:legacy_root    → 不需要劫持，ramdisk 里的 rc 全程有效
+```
+
+非 2SI 设备上 `hijack-prep` 会自动跳过——老设备上劫持既无效，还会把 boss
+bind 到 `/sdcard` 遮住内部存储。判定错了用 cmdline `boss_hijack=0/1` 现场纠正，
+不用重刷镜像。rc 整体压到 Android 5.0 就能解析的语法（不用
+`exec_background`、不写 `seclabel`），payload 的 `min_api` 已降到 23。
+
+详见 `docs/TASK-向下兼容-su与init.md`。
 
 已知最大限制：v0.2 的 init 接管（SwitchRoot 劫持）**代码已补齐但只能在真机验**。
 沙盒里能验到"命令拼对了、dry run 无副作用、变砖保护还在"，验不到"切根后真的

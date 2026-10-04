@@ -17,7 +17,23 @@
 #define _GNU_SOURCE 1
 
 #define BOSS_MAGIC      0xB0550001u   /* "BOSS" v1 */
+/* 用 #ifndef 包住：测试要用 -DBOSS_PROTO_VER=1 编一个"老客户端"出来，
+ * 验证新 daemon 能接住 v1 请求（真机上两份 boss 版本错开是常态）。
+ * 不包住的话命令行 -D 会被这里的无条件 #define 直接盖掉，
+ * 编出来的"老二进制"仍然是 v2——测试会假绿（这条真踩过）。 */
+#ifndef BOSS_PROTO_VER
 #define BOSS_PROTO_VER  2u
+#endif
+/* 向下兼容：daemon 仍然接得住的最低协议版本。
+ *
+ * 为什么不是"只认当前版本"：真机上 ramdisk 里的 boss 与 /data/adb/boss/boss
+ * 是**两份**二进制，OTA / 换包 / 手动升级都可能让它们版本错开——旧的 su 客户端
+ * 撞上新的 bossd（或反过来）时，严格相等检查会让整台机器的 root 静默失效，
+ * 症状是"su 还在，但所有命令都报内部错误"，极难联想到版本。
+ *
+ * v1 与 v2 的 struct boss_request 布局完全一致（v2 只是多用了几个标志位），
+ * 所以同一个 sizeof 就能读两种版本——这是"能兼容"的前提，别改结构体开头。 */
+#define BOSS_PROTO_MIN  1u
 #define BOSS_VERSION    "0.1.0"
 
 /* ---- 运行时路径（编译期可覆盖，便于主机侧冒烟测试） ---- */
@@ -93,6 +109,14 @@ enum {
  * 老 daemon 不认这个标志会把指令当命令跑一遍——所以协议版本同时升到了 2，
  * 不让它静默发生（"扩展语义必须升 PROTO_VER"是任务2 交接时的原话）。 */
 #define BOSS_F_UI       (1u << 4)   /* App 控制通道：pending / allow <id> / deny <id> */
+/* 向下兼容：Magisk 的 su -M / --mount-master。
+ *
+ * 老 root 应用有一批会传这个参数（它们想要"在全局 mount namespace 里执行"，
+ * 好让 mount 对全系统可见）。BOSS 的 daemon 由 init 拉起、本身就在全局
+ * mount namespace 里，所以这个语义**天然成立**——我们接受这个标志并按
+ * "已经满足"处理，而不是当成未知参数报错或忽略。
+ * 老 daemon 不认它时会把它当 0，行为一致，不会出错。 */
+#define BOSS_F_MOUNT_MASTER (1u << 5)
 
 struct boss_request {
     uint32_t magic;
@@ -129,6 +153,10 @@ void  boss_copy(char *dst, size_t n, const char *src);
 int   boss_proc_cmdline(pid_t pid, char *buf, size_t len);
 int   boss_send_fd(int sock, int fd);
 int   boss_send_handshake(int sock);   /* 建连第一步：送出退出码通道，返回本地端 fd */
+/* 向下兼容：按 PROTO_VER → PROTO_MIN 依次尝试，取对端接受的最高版本。
+ * 成功返回退出码通道 fd（可 -1），sock/ver 由指针带出；失败返回 -1。 */
+int   boss_negotiate(struct boss_request *req, const char *env_blob,
+                     struct boss_response *rep, int *sock_out, int *ver_out);
 int   boss_recv_fd(int sock);
 int   boss_mkdirs(const char *path, mode_t mode);
 int   boss_daemonize(void);

@@ -295,17 +295,40 @@ static void handle_client(int sock)
 
     char *env_blob = NULL, *arg_blob = NULL;
 
-    if (req.magic != BOSS_MAGIC || req.version != BOSS_PROTO_VER) {
+    /* 向下兼容：只校验"在可接范围内"，不再要求等于当前版本。
+     * 真机上 ramdisk 里的 boss 与 /data/adb/boss/boss 是两份二进制，
+     * 版本错开是常态（换包、OTA、手动升级），严格相等会让 root 静默失效。
+     *
+     * BOSS_PROTO_MAX 是测试开关：造一个"只认 v1 的老 daemon"，好让
+     * 客户端的降级重试有一条端到端的回归。真机上 daemon 由 rc 拉起，
+     * init 传下来的环境是空的，这个变量不可能被意外带上（与 BOSS_INIT_REAL
+     * / BOSS_LAYOUT 同一套路）。 */
+    unsigned proto_max = BOSS_PROTO_VER;
+    const char *pm = getenv("BOSS_PROTO_MAX");
+    if (pm) {
+        unsigned v = (unsigned)strtoul(pm, NULL, 10);
+        if (v >= BOSS_PROTO_MIN && v <= BOSS_PROTO_VER) proto_max = v;
+    }
+
+    if (req.magic != BOSS_MAGIC ||
+        req.version < BOSS_PROTO_MIN || req.version > proto_max) {
+        boss_log("拒绝请求：协议版本 %u 不在 [%u,%u] 内（uid=%u pid=%d）",
+                 req.version, BOSS_PROTO_MIN, BOSS_PROTO_VER,
+                 (unsigned)uid, (int)pid);
         respond(sock, BOSS_ERR, 0);
         goto done;
     }
 
     /* 任务6：UI 控制通道。必须在 fork 之前拦下来，
-     * 否则 "pending" 会被当成一条 shell 命令跑一遍。 */
-    if (req.flags & BOSS_F_UI) {
+     * 否则 "pending" 会被当成一条 shell 命令跑一遍。
+     * 只对 v2+ 生效：v1 客户端不可能设置这个标志（它不知道它的存在），
+     * 按版本再挡一层，免得老客户端的数据被误判成控制指令。 */
+    if ((req.flags & BOSS_F_UI) && req.version >= 2) {
         handle_ui(sock, &req, uid, pid);
         goto done;
     }
+    /* v1 客户端若阴差阳错带上了这个位，清掉即可：它只会发 shell 命令 */
+    req.flags &= ~(uint32_t)BOSS_F_UI;
 
     if (req.env_len && req.env_len <= BOSS_MAX_BLOB) {
         env_blob = malloc(req.env_len);
@@ -341,10 +364,11 @@ static void handle_client(int sock)
     boss_proc_cmdline(pid, caller, sizeof(caller));
 
     if (!(req.flags & BOSS_F_NOLOG)) {
-        boss_log("uid=%u pid=%d caller='%s' target=%u cmd='%s' ctx='%s' -> %s",
+        boss_log("uid=%u pid=%d caller='%s' target=%u cmd='%s' ctx='%s' proto=v%u -> %s",
                  (unsigned)uid, (int)pid, caller, req.target_uid,
                  req.command[0] ? req.command : "<interactive>",
                  req.context,
+                 req.version,   /* 混版本部署时这是唯一的线索 */
                  decision == BOSS_DECISION_ALLOW ? "allow" : "deny");
     }
 

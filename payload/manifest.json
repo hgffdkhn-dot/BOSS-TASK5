@@ -2,7 +2,7 @@
   "name": "boss",
   "version": "0.1.0",
   "arch": ["arm64", "arm", "x86_64", "x86"],
-  "min_api": 26,
+  "min_api": 23,
   "selinux": "keep",
   "cmdline_append": ["androidboot.boss=1"],
   "files": [

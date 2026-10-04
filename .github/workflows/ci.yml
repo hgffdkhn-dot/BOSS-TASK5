@@ -36,6 +36,27 @@ jobs:
         if: failure()
         run: cat /tmp/boss-test/boss.log 2>/dev/null || true
 
+  compat:
+    name: 向下兼容（su + init）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 三件事：rc 能不能被老 init 解析、布局探测有没有走对、
+      # 新/老二进制混着用还通不通（真机上 ramdisk 里的 boss 与
+      # /data/adb/boss/boss 是两份，版本必然会错开）。
+      - name: rc 语法下限 + 布局探测 + 协议/命令行兼容（28 项）
+        run: bash tools/compat_test.sh
+
+      # 老 init 的 rc 解析失败只会在日志里留一句 parse error，
+      # 表现却是"BOSS 一个动作都没做"——所以这条必须常驻，不能靠人记。
+      - name: 上传日志（失败时看这个）
+        if: failure()
+        run: |
+          cat /tmp/boss-test/boss.log 2>/dev/null || true
+          echo "--- rc 去注释后的指令行 ---"
+          sed 's/#.*$//' payload/init.boss.rc | grep -v '^[[:space:]]*$' || true
+
   strict:
     name: 严格编译（多 -std / -Werror）
     runs-on: ubuntu-latest
