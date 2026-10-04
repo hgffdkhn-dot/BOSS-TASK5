@@ -170,7 +170,7 @@ object RamdiskProbe {
      * 扫一遍，返回第一个**确实含 ramdisk** 的。
      *
      * 顺序：**块设备 by-name 优先**，普通文件兜底。
-     * 因为模拟器/虚拟机把 ramdisk 暴露成 `/dev/block/platform/*/by-name/*`
+     * 因为模拟器/虚拟机把 ramdisk 暴露成 `/dev/block/platform/<soc>/by-name/<name>`
      * 这种块设备节点，而真机刷机用的镜像反而常躺在 /sdcard 里。
      *
      * 不用"第一个存在的"——目录里可能有个空占位文件，
@@ -204,7 +204,7 @@ object RamdiskProbe {
         /* ⚠️ 这里曾经有个致命 bug：`size <= 0` 就直接 return null。
          *
          *   而**块设备的 File.length() 一律返回 0**（实测 /dev/zero、/dev/null
-         *   都是 0 字节，它们根本不是常规文件）。于是 /dev/block/** 下面
+         *   都是 0 字节，它们根本不是常规文件）。于是 /dev/block/ 下面
          *   每一个节点都被"大小为 0"这条判据无声跳过——
          *
          *   表现：明明 ramdisk 就在 /dev/block/platform/host/by-name/ramdisk，

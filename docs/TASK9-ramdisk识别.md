@@ -168,6 +168,70 @@ dd if=<dev> bs=1 count=512 | gzip -dc | head -c 6 | od -An -tx1
 否则用户只能报"显示否"，而"扫过哪些"才是定位的关键信息。
 主界面现在会列出扫描过的路径（节选 4 条）。
 
+## 6.5 ⚠️ 修的过程中引爆了一个更隐蔽的坑：Kotlin 块注释**可嵌套**
+
+修完探测逻辑后编译炸出几十条错：
+
+```
+RamdiskProbe.kt:167:6  Syntax error: Missing '}'
+RamdiskProbe.kt:316:1  Syntax error: Unclosed comment
+BossRepository.kt:44   Unresolved reference 'find'
+LocalInstallViewModel.kt:30  Unresolved reference 'PartitionInfo'
+...（几十条）
+```
+
+看着像"整个模块坏了"，**实际只错了一行注释**。
+
+### 真因
+
+注释正文里写了路径：
+
+```kotlin
+ * 因为模拟器/虚拟机把 ramdisk 暴露成 `/dev/block/platform/*/by-name/*`
+```
+
+`/dev/block/platform/*/by-name/*` 里有两个 `/*`、**零个** `*/`
+→ 各开一层嵌套注释 → 一直吞到文件尾。
+
+同样中招的还有 `于是 /dev/block/** 下面`（`/**` 里的 `/*` 也开层）。
+
+### 这个坑的三个特征
+
+1. **报错位置指向文件末尾**，离真因（第 173 行）很远
+2. 引发**几十条 Unresolved reference** 连锁报错——因为类体被注释吞掉，
+   里面的类型全找不到了
+3. 我那个"数花括号"的静态检查**测不出来**：它连注释里的括号一起数，
+   开头多一个 `{` 结尾多一个 `}` 正好抵消，结果是"平衡"的
+
+### 修法 + 守卫
+
+- 注释里的路径改成 `<soc>` / `<name>` 占位写法，不出现 `/*`
+- 新增 `tools/kotlin_comment_scan.py`：正确扫描块注释嵌套
+  （**只在注释外解析引号**）
+- 自检 3.8 节接入，不平衡直接 FAIL
+
+### ⚠️ 扫描器第一版自己也是错的（假阳性）
+
+它在注释**内部**也解析引号，于是上游文件里一句
+`Release the buffer holding the last command's output.`
+——那个撇号被当成字符字面量起点，一路吞掉后面的 `*/`，
+**一个完全正常的上游文件被报成"未闭合"**。
+
+修法：进入注释后**只**看 `/*` 与 `*/`，不再解析引号。
+
+### 反证（两头都验过）
+
+| 输入 | 结果 |
+|---|---|
+| 注入两种真实 bug | FAIL，指出第 169 行 |
+| 还原 | ok，21 个文件全平衡 |
+| 上游 Veritpath.java | ok，**不误报** |
+
+> 这是本仓**第四次**栽在"注释里的字面量"：
+> `?attr/colorControlNormal`、`Veritpath.analyze(...)`、
+> `write Veritpath.run(...)`、现在是 `/*`。
+> **写检查脚本时，你自己的注释也是输入的一部分。**
+
 ## 7. 验证状态
 
 | 项 | 状态 |

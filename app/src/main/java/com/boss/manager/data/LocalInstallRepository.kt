@@ -63,7 +63,7 @@ class LocalInstallRepository(private val app: Context) {
     /**
      * 找出 ramdisk 所在的分区。
      *
-     * ⚠️ 原来只查 `/dev/block/by-name`，**漏掉了 `/dev/block/platform/*/by-name`**。
+     * ⚠️ 原来只查 `/dev/block/by-name`，**漏掉了 `/dev/block/platform/<soc>/by-name`**。
      *    而模拟器/虚拟机几乎都走后者（如 `platform/host/by-name/ramdisk`），
      *    于是这些设备上本机安装页永远显示"未探测到分区"。
      *

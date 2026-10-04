@@ -232,6 +232,20 @@ except Exception:
 fi
 
 echo
+echo "== 3.8) 块注释平衡（Kotlin 的块注释可嵌套）=="
+
+    # 踩过：注释正文里写了 /dev/block/platform/*/by-name，
+    # 其中那两个字符会再开一层嵌套注释，一直吞到文件尾。
+    # 报错是 Missing } + Unclosed comment，且位置指向文件末尾——离真因很远；
+    # 还会引发几十条 Unresolved reference 连锁报错，看着像整个模块坏了。
+    # 独立脚本：嵌套 heredoc 会被转义层吃掉引号，所以抽成单独文件。
+    if python3 "$ROOT"/tools/kotlin_comment_scan.py "$ROOT"/app/src/main/java; then
+        ok "块注释平衡"
+    else
+        bad "块注释不平衡（注释正文里出现了开启注释的字符对）"
+    fi
+
+
 echo "== 4) gradle.properties =="
 # 只匹配**生效的**那一行：文件里有一大段注释在解释"为什么别写它"，
 # 直接 grep 关键字会命中注释，于是永远报 warn——假警报比没警报更烦人。
