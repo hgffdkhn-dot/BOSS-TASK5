@@ -246,6 +246,17 @@ echo "== 3.8) 块注释平衡（Kotlin 的块注释可嵌套）=="
     fi
 
 
+echo "== 3.9) 关键 Kotlin 符号存在性 =="
+    # 守的是"被脚本改文件时静默删掉函数"这类事故：
+    # 括号计数测不出来（整块删，开头少一个结尾也少一个，仍是 0）。
+    # 通用"引用完整性"检查做不了——Compose 大量通配导入，全是噪声。
+    # 所以只守关键符号，表手写在 tools/kotlin_symbols_scan.py 里。
+    if python3 "$ROOT"/tools/kotlin_symbols_scan.py "$ROOT"; then
+        ok "关键 Kotlin 符号齐全"
+    else
+        bad "有关键 Kotlin 符号丢失（多半是被脚本改文件时误删）"
+    fi
+
 echo "== 4) gradle.properties =="
 # 只匹配**生效的**那一行：文件里有一大段注释在解释"为什么别写它"，
 # 直接 grep 关键字会命中注释，于是永远报 warn——假警报比没警报更烦人。

@@ -232,6 +232,74 @@ LocalInstallViewModel.kt:30  Unresolved reference 'PartitionInfo'
 > `write Veritpath.run(...)`、现在是 `/*`。
 > **写检查脚本时，你自己的注释也是输入的一部分。**
 
+## 6.6 ⚠️ 我自己改脚本时误删了两个函数（readHead / hexToBytes）
+
+编译报：
+
+```
+RamdiskProbe.kt:217:20  Unresolved reference 'readHead'
+RamdiskProbe.kt:309:17  Unresolved reference 'hexToBytes'
+```
+
+**是我上一轮用 Python 按字符串索引切片改文件时，把这两个 private 函数
+整块删掉了。** 函数已补回。
+
+### 为什么之前的检查全都没抓到
+
+| 检查 | 为什么漏了 |
+|---|---|
+| 数花括号 | 删的是**一整块平衡的括号**——开头少一个 `{`、结尾也少一个 `}`，计数仍是 0 |
+| 块注释扫描 | 注释是平衡的，跟函数删没删无关 |
+| 调用/定义核对 | 只查跨文件（`repo.xxx`、`vm.xxx`），**不查同文件内的 private 成员** |
+
+> 这是同一个教训的第二次：
+> **结构性检查（括号/引号平衡）给的是虚假的安全感。**
+> 平衡不等于正确。
+
+### 试过做通用"调用但未定义"检查，放弃了
+
+第一版扫出 **200 多条全噪声**：
+
+```
+MainActivity.kt 调用了未定义的 Text()
+Theme.kt 调用了未定义的 Color()
+```
+
+原因：Compose 大量用**通配导入**（`androidx.compose.material3.*`），
+无法把 `Text` / `Column` 这类名字解析回导入。
+**没有编译器就做不出可靠的通用检查**——硬做只会更假。
+
+### 最终做法：只守关键符号的存在性
+
+`tools/kotlin_symbols_scan.py`，一张手写的表
+（每个文件不容丢失的关键 `fun` / `val` / `data class` / `enum class`）。
+
+- **零噪声**（实测：误删 → 精确指出缺 `fun readHead`、`fun hexToBytes`；还原 → 17 个文件齐全）
+- 正好覆盖"被脚本误删"这个真实故障
+- 自检 3.9 节接入
+
+代价是要手工维护表：新增关键函数时补一条。
+
+### ⚠️ 补回函数时，我把同一个注释 bug 又写了一遍
+
+补 `readHead` 时把注释原样抄回来：
+
+```kotlin
+ * ⚠️ 块设备**一律走 root**：App 对 /dev/block/** 既没有读权限，
+```
+
+`/dev/block/**` 里的 `/*` 又开了一层嵌套注释——**同一个坑，第二次踩**。
+是块注释扫描器（3.8 节）当场抓出来的，不是编译报的。
+
+> 教训：修过一次不代表不会再犯，**自动化守卫比记忆可靠**。
+> 这个坑在本仓已经触发两次，只有扫描器挡住了第二次。
+
+### 附带修正
+
+表里 `BossViewModel` 的 `verify` 一开始写成 `fun verify`，
+实际它是 `val verify: StateFlow<VerifyReport?>`（HomeScreen 用
+`collectAsStateWithLifecycle()` 订阅，不是调用）。写成 `fun` 会误报。
+
 ## 7. 验证状态
 
 | 项 | 状态 |

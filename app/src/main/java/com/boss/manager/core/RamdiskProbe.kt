@@ -312,4 +312,29 @@ object RamdiskProbe {
 
     // ------------------------------------------------------------ 读文件
 
+    /**
+     * 读前 n 字节。
+     *
+     * ⚠️ 块设备**一律走 root**：App 对 /dev/block/ 下的节点没有读权限，
+     *    而且 `canRead()` 可能返回 true 但实际读被 SELinux 拒——
+     *    那种半吊子状态比直接没权限更难查。
+     */
+    private fun readHead(path: String, n: Int, isBlock: Boolean): ByteArray? =
+        runCatching {
+            if (!isBlock) {
+                val f = java.io.File(path)
+                if (f.canRead()) return@runCatching f.inputStream().use { it.readNBytes(n) }
+            }
+            val hex = shell("dd if='$path' bs=1 count=$n 2>/dev/null | od -An -tx1")
+                ?: return@runCatching null
+            hexToBytes(hex).takeIf { it.isNotEmpty() }
+        }.getOrNull()
+
+    /** od -An -tx1 的输出 → 字节数组。长度奇数时丢弃最后一个半字节。 */
+    private fun hexToBytes(hex: String): ByteArray {
+        val clean = hex.filter { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+        val out = ByteArray(clean.length / 2)
+        for (i in out.indices) out[i] = clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        return out
+    }
 }
