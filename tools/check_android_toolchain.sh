@@ -297,6 +297,7 @@ echo "== 4.9) veritpath 对接（JNI 符号族 / vendored 源码）=="
 # 所以在开编之前静态查一次最划算。
 VP_DIR="$ROOT/app/src/main/cpp/veritpath"
 VP_JAVA="$ROOT/app/src/main/java/dev/veritpath/Veritpath.java"
+VP_JAVA_LOCAL="$VP_JAVA"
 if [ ! -d "$VP_DIR" ] || [ ! -f "$VP_JAVA" ]; then
     warn "没有 vendored veritpath —— 修补页会拿不到 .so"
 else
@@ -367,6 +368,26 @@ else
     else
         warn "上游 run() 缺 argv[0] 守卫 —— 拼装错了只会得到 unknown command"
     fi
+
+    # ⑥.5 vendored 的 Veritpath.java 语法对不对？
+    #     上游改动这个文件是常事（几乎每次同步都会变），一旦它自己带个语法错，
+    #     后果是**整包编译失败**，而报错指向的是上游文件——很容易误判成我们改坏了。
+    #     实测踩过一次：上游 run() 的新异常消息里字符串引号没转义。
+    if python3 -c "import javalang" 2>/dev/null && [ -f "$VP_JAVA_LOCAL" ]; then
+        if python3 -c "
+import sys, javalang
+javalang.parse.parse(open(sys.argv[1]).read())
+" "$VP_JAVA_LOCAL" 2>/dev/null; then
+            ok "vendored Veritpath.java 语法 OK"
+        else
+            bad "vendored Veritpath.java 有语法错误（多半来自上游，需本地转义修复）"
+        fi
+    fi
+
+    # ⑥.6 上游 2026-10-04 已自己修好字符串转义，本地补丁**已退休**。
+    #     不再检查"本地转义还在不在"——那种检查只在补丁期有意义，
+    #     留着会在将来某次同步后误报（上游改了措辞就不是那个锚点了）。
+    #     语法正确性由上面 ⑥.5 的 javalang 解析兜住，它对任何改动都有效。
 
     # ⑦ --keep-trailing 接上没有？
     #    dd 出来的整分区镜像（100MB+）repack 后只剩真实内容（几十 MB），

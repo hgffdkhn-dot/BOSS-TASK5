@@ -619,15 +619,35 @@ static void print_rich(analysis_t *res)
     kv("injection target", res->target[0] ? res->target : "none");
 }
 
+/* Escaped copy for a %s in JSON output. Four rotating buffers, which is plenty
+ * for the few strings printed on one line. */
+static const char *json_s(const char *s)
+{
+    static buf_t b[4];
+    static int init = 0, turn = 0;
+    if (!init) {
+        for (int i = 0; i < 4; i++)
+            buf_init(&b[i]);
+        init = 1;
+    }
+    buf_t *t = &b[turn];
+    turn = (turn + 1) % 4;
+    buf_reset(t);
+    vp_json_escape(t, s ? s : "");
+    return t->data ? (const char *)t->data : "";
+}
+
 void detect_print(analysis_t *res, int mode)
 {
     if (mode == VP_OUT_JSON) {
+        /* these are internal strings today, but they are printed as JSON and
+         * must survive a quote the same way the marker does */
         printf("{\n");
-        printf("  \"arch\": \"%s\",\n", res->arch);
+        printf("  \"arch\": \"%s\",\n", json_s(res->arch));
         printf("  \"android_api\": %d,\n", res->android_api);
-        printf("  \"android_version\": \"%s\",\n", res->android_version);
-        printf("  \"ramdisk_layout\": \"%s\",\n", res->layout);
-        printf("  \"target\": \"%s\",\n", res->target);
+        printf("  \"android_version\": \"%s\",\n", json_s(res->android_version));
+        printf("  \"ramdisk_layout\": \"%s\",\n", json_s(res->layout));
+        printf("  \"target\": \"%s\",\n", json_s(res->target));
         printf("  \"system_as_root\": %s,\n", res->system_as_root ? "true" : "false");
         printf("  \"gki\": %s,\n", res->gki ? "true" : "false");
         printf("  \"already_patched\": %s,\n", res->already_patched ? "true" : "false");
@@ -636,7 +656,7 @@ void detect_print(analysis_t *res, int mode)
             printf("  \"trailing\": {");
             for (int i = 0; i < res->n_trailing; i++)
                 printf("%s\"%s\": %zu", i ? ", " : "",
-                       res->trailing_role[i], res->trailing[i]);
+                       json_s(res->trailing_role[i]), res->trailing[i]);
             printf("},\n");
         }
         printf("  \"needs_ramdisk\": %s\n", res->needs_ramdisk ? "true" : "false");

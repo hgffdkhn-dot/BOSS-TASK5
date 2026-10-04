@@ -666,3 +666,33 @@ int vp_path_is_safe(const char *n)
     }
     return 1;
 }
+
+/* Append s to a buffer as a JSON string body (no surrounding quotes).
+ *
+ * The marker written into /veritpath.json takes the payload's name, version
+ * and file dests straight from the manifest, and that manifest comes from
+ * whoever wrote the payload. A name containing a quote produced
+ *   "payload": "my "quoted" su"
+ * i.e. a marker file that is not valid JSON at all - and it is written into
+ * the ramdisk, where init-side code is expected to parse it.
+ */
+void vp_json_escape(buf_t *out, const char *s)
+{
+    if (!s)
+        return;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\')
+            buf_appendf(out, "\\%c", c);
+        else if (c == '\n')
+            buf_append_str(out, "\\n");
+        else if (c == '\r')
+            buf_append_str(out, "\\r");
+        else if (c == '\t')
+            buf_append_str(out, "\\t");
+        else if (c < 0x20)
+            buf_appendf(out, "\\u%04x", c);
+        else
+            buf_append(out, s, 1);
+    }
+}

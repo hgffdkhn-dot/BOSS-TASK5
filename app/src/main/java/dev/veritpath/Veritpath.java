@@ -117,7 +117,7 @@ public final class Veritpath {
         if (args != null && args.length > 0 && args[0] != null && args[0].startsWith("-")) {
             throw new IllegalArgumentException(
                 "the sub-command must be args[0], got '" + args[0] + "' - "
-                + "write Veritpath.run("analyze", "--boot", path)");
+                + "write Veritpath.run(\"analyze\", \"--boot\", path)");
         }
         int code = nativeRun(args);
         return new Result(code, nativeLastOutput());

@@ -508,14 +508,16 @@ int payload_apply(cpio_archive_t *a, size_t seg, payload_t *p, inject_result_t *
     buf_t marker;
     buf_init(&marker);
     buf_append_str(&marker, "{\n  \"tool\": \"veritpath\",\n  \"payload\": \"");
-    buf_append_str(&marker, p->name);
+    vp_json_escape(&marker, p->name);
     buf_append_str(&marker, "\",\n  \"version\": \"");
-    buf_append_str(&marker, p->version);
+    vp_json_escape(&marker, p->version);
     buf_append_str(&marker, "\",\n  \"files\": [");
     for (int i = 0; i < p->n_files; i++) {
         if (i)
             buf_append_str(&marker, ", ");
-        buf_appendf(&marker, "\"%s\"", p->files[i].dest);
+        buf_append_str(&marker, "\"");
+        vp_json_escape(&marker, p->files[i].dest);
+        buf_append_str(&marker, "\"");
     }
     buf_append_str(&marker, "]\n}\n");
     cpio_entry_t mk;

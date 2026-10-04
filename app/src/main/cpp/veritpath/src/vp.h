@@ -45,6 +45,7 @@ int buf_reserve(buf_t *b, size_t extra);
 int buf_append(buf_t *b, const void *data, size_t len);
 int buf_append_str(buf_t *b, const char *s);
 int buf_appendf(buf_t *b, const char *fmt, ...);
+void vp_json_escape(buf_t *out, const char *s);  /* JSON string body, no quotes */
 int buf_append_pad(buf_t *b, size_t align, uint8_t fill);
 
 int read_file(const char *path, buf_t *out);

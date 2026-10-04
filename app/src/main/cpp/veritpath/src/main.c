@@ -924,18 +924,10 @@ static buf_t *comp_buf(boot_img_t *img, size_t off)
     return (buf_t *)((uint8_t *)img + off);
 }
 
+/* see vp_json_escape in util.c */
 static void json_str(buf_t *j, const char *s)
 {
-    for (; *s; s++) {
-        if (*s == '"' || *s == '\\')
-            buf_appendf(j, "\\%c", *s);
-        else if (*s == '\n')
-            buf_append_str(j, "\\n");
-        else if ((unsigned char)*s < 0x20)
-            buf_appendf(j, "\\u%04x", (unsigned char)*s);
-        else
-            buf_append(j, s, 1);
-    }
+    vp_json_escape(j, s);
 }
 
 static int cmd_unpack(args_t *a)

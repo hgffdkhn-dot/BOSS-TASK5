@@ -24,7 +24,9 @@ import com.boss.manager.ui.SectionCard
 fun SuperuserScreen(vm: BossViewModel) {
     var tab by remember { mutableIntStateOf(0) }
     Column(Modifier.fillMaxSize()) {
-        TabRow(selectedTabIndex = tab) {
+        // M3 里 TabRow 已拆成 PrimaryTabRow / SecondaryTabRow，老的 TabRow 弃用了。
+        // 这是主导航级标签，用 PrimaryTabRow（次级用 SecondaryTabRow）。
+        PrimaryTabRow(selectedTabIndex = tab) {
             listOf("待裁决", "策略", "审计日志").forEachIndexed { i, t ->
                 Tab(selected = i == tab, onClick = { tab = i }, text = { Text(t) })
             }
